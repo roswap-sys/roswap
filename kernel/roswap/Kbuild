@@ -1,0 +1,29 @@
+obj-m += roswap.o
+
+roswap-y := \
+	main.o \
+	core/slot.o \
+	core/extent.o \
+	core/chunk.o \
+	core/node.o \
+	core/io.o \
+	core/meta_test.o \
+	transport/conn.o \
+	transport/qp.o \
+	frontend/blk.o \
+	ctl/debugfs.o
+
+# KUnit 用例单独成模块，避免和 roswap 的 module_init 冲突。
+ifneq ($(filter y m,$(CONFIG_KUNIT)),)
+obj-m += roswap_kunit.o
+roswap_kunit-y := tests/extent_kunit.o
+endif
+
+ccflags-y += -Wall
+ccflags-y += -I$(src)/include -I$(src)/../../uapi
+
+ifneq ($(OFED_DIR),)
+ccflags-y += -I$(OFED_DIR)/include
+ccflags-y += -include $(OFED_DIR)/include/linux/compat-2.6.h
+KBUILD_EXTRA_SYMBOLS := $(OFED_DIR)/Module.symvers
+endif
