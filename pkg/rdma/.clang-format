@@ -1,3 +1,0 @@
-# Userspace C used by cgo. Kernel code follows the Linux kernel style.
-BasedOnStyle: Google
-ColumnLimit: 80
