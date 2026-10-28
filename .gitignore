@@ -10,7 +10,6 @@
 Module.symvers
 modules.order
 
-bin/
 *.out
 /target
 
