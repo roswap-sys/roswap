@@ -12,6 +12,7 @@ modules.order
 
 bin/
 *.out
+/target
 
 build/
 CMakeCache.txt
