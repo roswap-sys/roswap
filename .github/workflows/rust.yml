@@ -25,19 +25,19 @@ jobs:
           librdmacm-dev \
           rdma-core \
           ibverbs-providers \
-          iproute2 \
-          linux-modules-extra-$(uname -r)
-    
+          iproute2
+        sudo apt-get install -y "linux-modules-extra-$(uname -r)" || sudo apt-get install -y linux-modules-extra-azure || true
+
     - name: Setup Soft-RoCE (rdma_rxe)
       run: |
-        sudo modprobe rdma_rxe
-        sudo modprobe rdma_ucm
+        sudo modprobe rdma_rxe || sudo modprobe siw
+        sudo modprobe rdma_ucm || true
         NETDEV=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-        echo "Binding rxe0 to netdev: $NETDEV"
-        sudo rdma link add rxe0 type rxe netdev "$NETDEV"
+        echo "Binding RDMA device to netdev: $NETDEV"
+        sudo rdma link add rxe0 type rxe netdev "$NETDEV" || sudo rdma link add siw0 type siw netdev "$NETDEV"
         rdma link show
         ibv_devices
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose -- --test-threads=1
