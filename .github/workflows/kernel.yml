@@ -37,6 +37,7 @@ jobs:
     - name: Load, verify, and unload roswap.ko
       run: |
         sudo insmod kernel/roswap.ko
+        sudo udevadm settle
         ls -l /dev/roswap0
         cat /sys/block/roswap0/size
         sudo rmmod roswap
