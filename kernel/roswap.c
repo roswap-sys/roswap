@@ -6,6 +6,13 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#define roswap_cleanup_disk(disk) put_disk(disk)
+#else
+#define roswap_cleanup_disk(disk) blk_cleanup_disk(disk)
+#endif
 
 static int roswap_major_id;
 static struct gendisk *roswap_disk;
@@ -62,7 +69,7 @@ static int roswap_add_disk(void)
 	return 0;
 
 err_disk:
-	blk_cleanup_disk(roswap_disk);
+	roswap_cleanup_disk(roswap_disk);
 	roswap_disk = NULL;
 err_tag:
 	blk_mq_free_tag_set(&roswap_tag_set);
@@ -93,7 +100,7 @@ static int __init roswap_init(void)
 static void __exit roswap_exit(void)
 {
 	del_gendisk(roswap_disk);
-	blk_cleanup_disk(roswap_disk);
+	roswap_cleanup_disk(roswap_disk);
 	roswap_disk = NULL;
 	blk_mq_free_tag_set(&roswap_tag_set);
 	unregister_blkdev(roswap_major_id, "roswap");
