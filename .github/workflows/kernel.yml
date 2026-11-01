@@ -1,0 +1,43 @@
+name: roswap.ko
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/kernel.yml'
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/kernel.yml'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install kernel headers and build tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          kmod \
+          linux-headers-$(uname -r)
+
+    - name: Build kernel module and blkcheck tool
+      run: |
+        uname -a
+        make -C kernel
+        modinfo kernel/roswap.ko
+        gcc -O2 -Wall -Wextra tools/blkcheck.c -o tools/blkcheck
+
+    - name: Load, verify, and unload roswap.ko
+      run: |
+        sudo insmod kernel/roswap.ko
+        ls -l /dev/roswap0
+        cat /sys/block/roswap0/size
+        sudo rmmod roswap
+        sudo dmesg | tail -n 20
