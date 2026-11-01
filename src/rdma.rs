@@ -113,6 +113,8 @@ impl RdmaDeviceContext {
 
         let mut chosen_ctx: *mut sys::ibv_context = std::ptr::null_mut();
         let mut chosen_name = String::new();
+        let mut fallback_ctx: *mut sys::ibv_context = std::ptr::null_mut();
+        let mut fallback_name = String::new();
 
         for i in 0..(num_devs as usize) {
             let ctx_ptr = unsafe { *ctx_list.add(i) };
@@ -137,10 +139,23 @@ impl RdmaDeviceContext {
                     break;
                 }
             } else {
-                chosen_ctx = ctx_ptr;
-                chosen_name = name;
-                break;
+                if fallback_ctx.is_null() {
+                    fallback_ctx = ctx_ptr;
+                    fallback_name = name.clone();
+                }
+                if rdma_dev_ipv4(&name).is_some() {
+                    chosen_ctx = ctx_ptr;
+                    chosen_name = name;
+                    if chosen_name.starts_with("rxe") || chosen_name.starts_with("siw") {
+                        break;
+                    }
+                }
             }
+        }
+
+        if chosen_ctx.is_null() && preferred_dev.is_none() {
+            chosen_ctx = fallback_ctx;
+            chosen_name = fallback_name;
         }
 
         unsafe { sys::rdma_free_devices(ctx_list) };
@@ -238,18 +253,29 @@ pub fn sockaddr_from_v4(addr: SocketAddrV4) -> sys::sockaddr_in {
     }
 }
 
+pub fn rdma_dev_ipv4(dev_name: &str) -> Option<Ipv4Addr> {
+    let net_dir = std::path::Path::new("/sys/class/infiniband")
+        .join(dev_name)
+        .join("ports/1/gid_attrs/ndevs");
+    if let Ok(ndevs) = std::fs::read_dir(net_dir) {
+        for ndev in ndevs.flatten() {
+            if let Ok(ifname) = std::fs::read_to_string(ndev.path()) {
+                let ifname = ifname.trim();
+                if let Some(ip) = ipv4_of_interface(ifname) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn local_rdma_ipv4() -> Option<Ipv4Addr> {
     if let Ok(entries) = std::fs::read_dir("/sys/class/infiniband") {
         for entry in entries.flatten() {
-            let net_dir = entry.path().join("ports/1/gid_attrs/ndevs");
-            if let Ok(ndevs) = std::fs::read_dir(net_dir) {
-                for ndev in ndevs.flatten() {
-                    if let Ok(ifname) = std::fs::read_to_string(ndev.path()) {
-                        let ifname = ifname.trim();
-                        if let Some(ip) = ipv4_of_interface(ifname) {
-                            return Some(ip);
-                        }
-                    }
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(ip) = rdma_dev_ipv4(name) {
+                    return Some(ip);
                 }
             }
         }

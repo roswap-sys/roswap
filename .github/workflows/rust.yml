@@ -17,7 +17,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install RDMA libraries and kernel modules
+    - name: Install RDMA libraries
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -25,8 +25,8 @@ jobs:
           librdmacm-dev \
           rdma-core \
           ibverbs-providers \
+          ibverbs-utils \
           iproute2
-        sudo apt-get install -y "linux-modules-extra-$(uname -r)" || sudo apt-get install -y linux-modules-extra-azure || true
 
     - name: Setup Soft-RoCE (rdma_rxe)
       run: |
@@ -36,7 +36,7 @@ jobs:
         echo "Binding RDMA device to netdev: $NETDEV"
         sudo rdma link add rxe0 type rxe netdev "$NETDEV" || sudo rdma link add siw0 type siw netdev "$NETDEV"
         rdma link show
-        ibv_devices
+        ibv_devices || true
     - name: Build
       run: cargo build --verbose
     - name: Run tests
