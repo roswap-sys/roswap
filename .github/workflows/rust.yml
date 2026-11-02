@@ -26,7 +26,8 @@ jobs:
           rdma-core \
           ibverbs-providers \
           ibverbs-utils \
-          iproute2
+          iproute2 \
+          protobuf-compiler
 
     - name: Setup Soft-RoCE (rdma_rxe)
       run: |

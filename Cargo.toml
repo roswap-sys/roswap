@@ -5,6 +5,18 @@ edition = "2021"
 
 [dependencies]
 log = "0.4"
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tonic = "0.14"
+tonic-prost = "0.14"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "tracing-log"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
