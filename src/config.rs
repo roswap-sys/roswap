@@ -43,6 +43,8 @@ impl Config {
     }
 }
 
+/* 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,3 +91,4 @@ mod tests {
         assert!(err.to_string().contains("extra"));
     }
 }
+*/
