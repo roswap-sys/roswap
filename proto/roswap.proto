@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0
+syntax = "proto3";
+
+package roswap;
+
+service ProviderService {
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  string version = 1;
+}

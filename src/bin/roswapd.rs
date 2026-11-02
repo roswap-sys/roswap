@@ -1,13 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0
 use log::{error, info, warn};
-use roswap::provider::{ProviderConfig, ProviderRuntime};
+use roswap::config::{Config, Role};
+use roswap::provider::ProviderRuntime;
 use std::env;
-use std::net::SocketAddrV4;
-use std::path::PathBuf;
-use std::process;
 use std::io::IsTerminal;
+use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+
+
+fn main() {
+    init_tracing();
+
+    let cfg = init_config();
+
+    init_roswapd_runtime(cfg);
+
+}
+
+fn init_roswapd_runtime(cfg:  Config){
+    match cfg.role {
+        Role::Provider => {
+            let mut runtime = ProviderRuntime::init(cfg.provider).unwrap_or_else(|e| {
+                error!("provider init failed: {e}");
+                process::exit(1);
+            });
+            runtime.log_summary();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            if let Err(e) = runtime.run_until_stopped(stop) {
+                error!("provider runtime error: {e}");
+                process::exit(1);
+            }
+        }
+        Role::Controller => {
+            warn!("controller role is a placeholder");
+            error!("unsupported role: {}", cfg.role);
+            process::exit(1);
+        }
+    }
+}
+
 
 fn init_tracing() {
     let (level, log_filter) = match env::var("RUST_LOG").ok().as_deref() {
@@ -29,137 +63,22 @@ fn init_tracing() {
         .init();
 }
 
-fn print_usage(prog: &str) {
-    eprintln!(
-        "Usage: {prog} 
-            [--role provider|controller] 
-            [--device <dev>] 
-            [--listen <ip:port>] 
-            [--mem-dir <path>] 
-            [--chunk-size-mb <mb>] 
-            [--chunks <n>] 
-            [--epoch <e>]"
-    );
-}
+fn init_config()->Config{
 
-
-fn main() {
-    init_tracing();
-
-    let args: Vec<String> = env::args().collect();
-    let prog = args.first().map(|s| s.as_str()).unwrap_or("roswapd");
-
-    let mut role = String::from("provider");
-    let mut cfg = ProviderConfig::default();
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--role" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                role = args[i].clone();
-            }
-            "--device" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.device_name = Some(args[i].clone());
-            }
-            "--listen" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.listen_addr = args[i].parse::<SocketAddrV4>().unwrap_or_else(|e| {
-                    error!("invalid --listen address {}: {e}", args[i]);
-                    process::exit(1);
-                });
-            }
-            "--mem-dir" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.mem_dir = PathBuf::from(&args[i]);
-            }
-            "--chunk-size-mb" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.chunk_size_mb = args[i].parse::<usize>().unwrap_or_else(|e| {
-                    error!("invalid --chunk-size-mb {}: {e}", args[i]);
-                    process::exit(1);
-                });
-            }
-            "--chunks" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.num_chunks = args[i].parse::<usize>().unwrap_or_else(|e| {
-                    error!("invalid --chunks {}: {e}", args[i]);
-                    process::exit(1);
-                });
-            }
-            "--epoch" => {
-                i += 1;
-                if i >= args.len() {
-                    print_usage(prog);
-                    process::exit(1);
-                }
-                cfg.node_epoch = args[i].parse::<u32>().unwrap_or_else(|e| {
-                    error!("invalid --epoch {}: {e}", args[i]);
-                    process::exit(1);
-                });
-            }
-            "-h" | "--help" => {
-                print_usage(prog);
-                return;
-            }
-            other => {
-                error!("unknown option: {other}");
-                print_usage(prog);
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    info!("roswapd starting role={role}");
-
-    match role.as_str() {
-        "provider" => {
-            let mut runtime = ProviderRuntime::init(cfg).unwrap_or_else(|e| {
-                error!("provider init failed: {e}");
-                process::exit(1);
-            });
-            runtime.log_summary();
-
-            let stop = Arc::new(AtomicBool::new(false));
-            if let Err(e) = runtime.run_until_stopped(stop) {
-                error!("provider runtime error: {e}");
-                process::exit(1);
-            }
-        }
-        "controller" => {
-            warn!("controller role is a placeholder");
-            error!("unsupported role: {role}");
-        }
+    let mut args = env::args();
+    let prog = args.next().unwrap_or_else(|| "roswapd".to_string());
+    let config_path = match (args.next(), args.next()) {
+        (Some(path), None) => path,
         _ => {
-            error!("unsupported role: {role}");
-            print_usage(prog);
+            eprintln!("Usage: {prog} <config.toml>");
             process::exit(1);
         }
-    }
+    };
+
+    let cfg = Config::load(&config_path).unwrap_or_else(|e| {
+        error!("failed to load {config_path}: {e}");
+        process::exit(1);
+    });
+    info!("roswapd starting role={} config={config_path}", cfg.role);
+    cfg
 }

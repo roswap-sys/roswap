@@ -5,10 +5,11 @@ use crate::rdma::{
 };
 use crate::sys;
 use log::{debug, info, warn};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,13 +17,49 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
+fn default_listen_addr() -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18515)
+}
+
+fn default_mem_dir() -> PathBuf {
+    PathBuf::from("/dev/shm/roswap")
+}
+
+fn default_chunk_size_mb() -> usize {
+    64
+}
+
+fn default_num_chunks() -> usize {
+    1
+}
+
+fn default_node_epoch() -> u32 {
+    1
+}
+
+fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.filter(|s| !s.is_empty()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
+    /// 空字符串或省略表示自动选择 RDMA 设备。
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub device_name: Option<String>,
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddrV4,
+    #[serde(default = "default_mem_dir")]
     pub mem_dir: PathBuf,
+    #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: usize,
+    #[serde(default = "default_num_chunks")]
     pub num_chunks: usize,
+    #[serde(default = "default_node_epoch")]
     pub node_epoch: u32,
 }
 
@@ -30,11 +67,11 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             device_name: None,
-            listen_addr: "0.0.0.0:18515".parse().unwrap(),
-            mem_dir: PathBuf::from("/dev/shm/roswap"),
-            chunk_size_mb: 64,
-            num_chunks: 1,
-            node_epoch: 1,
+            listen_addr: default_listen_addr(),
+            mem_dir: default_mem_dir(),
+            chunk_size_mb: default_chunk_size_mb(),
+            num_chunks: default_num_chunks(),
+            node_epoch: default_node_epoch(),
         }
     }
 }
