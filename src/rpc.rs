@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
-
+use tonic::{Request, Response, Status};
 tonic::include_proto!("roswap");
+
+pub struct Info;
+
+#[tonic::async_trait]
+impl provider_service_server::ProviderService for Info{
+    async fn get_info(&self, _request: Request<GetInfoRequest>)->Result<Response<GetInfoResponse>,Status>{
+        Ok(Response::new(GetInfoResponse { version: "info version: 1.0.0".to_string() }))
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 
 #[cfg(test)]
 mod tests {

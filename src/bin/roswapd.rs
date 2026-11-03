@@ -7,6 +7,10 @@ use std::io::IsTerminal;
 use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use roswap::rpc::provider_service_server::ProviderServiceServer;
+use roswap::rpc::Info;
+use std::net::{SocketAddr};
+use tonic::transport::Server;
 
 
 
@@ -15,19 +19,20 @@ fn main() {
 
     let cfg = init_config();
 
-    init_roswapd_runtime(cfg);
+    init_roswapd_runtime(&cfg);
 
 }
 
-fn init_roswapd_runtime(cfg:  Config){
+fn init_roswapd_runtime(cfg:  & Config){
     match cfg.role {
         Role::Provider => {
-            let mut runtime = ProviderRuntime::init(cfg.provider).unwrap_or_else(|e| {
+            let mut runtime = ProviderRuntime::init(&cfg.provider).unwrap_or_else(|e| {
                 error!("provider init failed: {e}");
                 process::exit(1);
             });
             runtime.log_summary();
 
+            init_provider_rpc_service(cfg);
             let stop = Arc::new(AtomicBool::new(false));
             if let Err(e) = runtime.run_until_stopped(stop) {
                 error!("provider runtime error: {e}");
@@ -81,4 +86,23 @@ fn init_config()->Config{
     });
     info!("roswapd starting role={} config={config_path}", cfg.role);
     cfg
+}
+
+fn init_provider_rpc_service(cfg: &Config){
+    let grpc_addr: SocketAddr = cfg.provider.grpc_addr;
+    let _grpc = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("grpc runtime");
+        rt.block_on(async move {
+            Server::builder()
+                .add_service(ProviderServiceServer::new(Info))
+                .serve(grpc_addr)
+                .await
+                .expect("grpc server");
+        });
+    });
+    info!("rpc serivce started addr={} ",cfg.provider.grpc_addr);
+
 }

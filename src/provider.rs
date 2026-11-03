@@ -5,37 +5,17 @@ use crate::rdma::{
 };
 use crate::sys;
 use log::{debug, info, warn};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-
-fn default_listen_addr() -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18515)
-}
-
-fn default_mem_dir() -> PathBuf {
-    PathBuf::from("/dev/shm/roswap")
-}
-
-fn default_chunk_size_mb() -> usize {
-    64
-}
-
-fn default_num_chunks() -> usize {
-    1
-}
-
-fn default_node_epoch() -> u32 {
-    1
-}
 
 fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -45,33 +25,31 @@ where
     Ok(value.filter(|s| !s.is_empty()))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
     /// 空字符串或省略表示自动选择 RDMA 设备。
-    #[serde(default, deserialize_with = "empty_string_as_none")]
+    #[serde(deserialize_with = "empty_string_as_none")]
     pub device_name: Option<String>,
-    #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddrV4,
-    #[serde(default = "default_mem_dir")]
+    pub grpc_addr: SocketAddr,
     pub mem_dir: PathBuf,
-    #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: usize,
-    #[serde(default = "default_num_chunks")]
     pub num_chunks: usize,
-    #[serde(default = "default_node_epoch")]
     pub node_epoch: u32,
+
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             device_name: None,
-            listen_addr: default_listen_addr(),
-            mem_dir: default_mem_dir(),
-            chunk_size_mb: default_chunk_size_mb(),
-            num_chunks: default_num_chunks(),
-            node_epoch: default_node_epoch(),
+            listen_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18515),
+            grpc_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 12220)),
+            mem_dir: PathBuf::from("/dev/shm/roswap"),
+            chunk_size_mb: 64,
+            num_chunks: 1,
+            node_epoch: 1,
         }
     }
 }
@@ -88,8 +66,10 @@ pub struct ProviderRuntime {
 
 unsafe impl Send for ProviderRuntime {}
 
+
+
 impl ProviderRuntime {
-    pub fn init(config: ProviderConfig) -> io::Result<Self> {
+    pub fn init(config: &ProviderConfig) -> io::Result<Self> {
         unsafe {
             let _ = sys::mlockall(sys::MCL_CURRENT | sys::MCL_FUTURE);
         }
@@ -165,7 +145,7 @@ impl ProviderRuntime {
         }
 
         Ok(Self {
-            config,
+            config: config.clone(),
             rdma,
             heartbeat,
             chunks,
@@ -437,19 +417,21 @@ mod tests {
         let target_ip = local_rdma_ipv4().expect("find RDMA interface IPv4");
         let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18599);
         let connect_addr = SocketAddrV4::new(target_ip, 18599);
+        let grpc_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 12220));
         let test_dir = PathBuf::from("/dev/shm/roswap-test-rdma");
         let _ = fs::remove_dir_all(&test_dir);
 
         let cfg = ProviderConfig {
             device_name: None,
             listen_addr,
+            grpc_addr,
             mem_dir: test_dir.clone(),
             chunk_size_mb: 4,
             num_chunks: 1,
             node_epoch: 3,
         };
 
-        let mut provider = ProviderRuntime::init(cfg).expect("init provider");
+        let mut provider = ProviderRuntime::init(&cfg).expect("init provider");
         let remote_chunk_addr = provider.chunks[0].addr();
         let remote_chunk_rkey = provider.chunks[0].rkey();
         let remote_hb_addr = provider.heartbeat.addr();
