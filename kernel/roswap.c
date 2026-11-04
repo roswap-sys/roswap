@@ -8,6 +8,8 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/version.h>
+#include <rdma/ib_verbs.h>
+#include <rdma/rdma_cm.h>
 
 
 
@@ -21,6 +23,9 @@
 #define RS_CONN_MAGIC		0x52535750
 #define RS_CONN_VERSION		1
 #define RS_QP_BULK		2
+
+#define ROSWAP_QUEUE_DEPTH	128
+#define ROSWAP_CM_TIMEOUT_MS	2000
 
 struct rs_conn_pdata {
 	__be32 magic;
@@ -56,6 +61,8 @@ MODULE_PARM_DESC(chunk_size_mb, " remote chunk size in MiB, also the disk capaci
 static int roswap_major_id;
 static struct gendisk *roswap_disk;
 static struct blk_mq_tag_set roswap_tag_set;
+static struct roswap_conn roswap_conn;
+
 
 static blk_status_t roswap_queue_rq(struct blk_mq_hw_ctx *hctx,
 				    const struct blk_mq_queue_data *bd)
@@ -72,6 +79,167 @@ static const struct blk_mq_ops roswap_mq_ops = {
 static const struct block_device_operations roswap_fops = {
 	.owner = THIS_MODULE,
 };
+
+struct roswap_conn {
+	struct rdma_cm_id *cm_id;
+	struct ib_pd *pd;
+	struct ib_cq *cq;
+	struct completion cm_done;
+	enum rdma_cm_event_type cm_event;
+	int cm_status;
+	bool connected;
+};
+
+static int roswap_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *ev)
+{
+	struct roswap_conn *conn = id->context;
+	if (ev->event == RDMA_CM_EVENT_DISCONNECTED || ev->event == RDMA_CM_EVENT_DEVICE_REMOVAL) {
+		WRITE_ONCE(conn->connected, false);
+		pr_warn("%s\n", rdma_event_msg(ev->event));
+	}
+	conn->cm_event = ev->event;
+	conn->cm_status = ev->status;
+	complete(&conn->cm_done);
+	return 0;
+}
+
+static int roswap_cm_wait(struct roswap_conn *conn, 
+					enum rdma_cm_event_type expected)
+{
+	if(!wait_for_completion_timeout(&conn->cm_done,
+			msecs_to_jiffies(3*ROSWAP_CM_TIMEOUT_MS)))
+			return -ETIMEDOUT;
+	if (conn->cm_event != expected) {
+		pr_err("rdma_cm %s, status %d \n", rdma_event_msg(conn->cm_event), conn->cm_status);
+		return -ECONNREFUSED;
+	}
+	return 0;
+}
+
+static int roswap_parse_server(struct sockaddr_in *sin)
+{
+	const char *end;
+	u16 port;
+
+	memset(sin, 0, sizeof(*sin));
+	sin->sin_family = AF_INET;
+	if (!in4_pton(server, -1, (u8 *)&sin->sin_addr.s_addr, ':', &end) ||
+	    *end != ':' || kstrtou16(end + 1, 10, &port))
+		return -EINVAL;
+	sin->sin_port = htons(port);
+	return 0;
+}
+
+
+
+static int roswap_rdma_connect(struct roswap_conn *conn)
+{
+	struct rs_conn_pdata pdata = {
+		.magic = cpu_to_be32(RS_CONN_MAGIC),
+		.version = cpu_to_be16(RS_CONN_VERSION),
+		.purpose = RS_QP_BULK,
+	};
+	struct rdma_conn_param param = {
+		.private_data = &pdata,
+		.private_data_len = sizeof(pdata),
+		.retry_count = 4,
+		.rnr_retry_count = 3,
+	};
+	struct ib_qp_init_attr qp_attr = {
+		.cap = {
+			.max_send_wr = ROSWAP_QUEUE_DEPTH,
+			.max_recv_wr = 1,
+			.max_send_sge = 1,
+			.max_recv_sge = 1,
+		},
+		.sq_sig_type = IB_SIGNAL_REQ_WR,
+		.qp_type = IB_QPT_RC,
+	};
+	struct sockaddr_in sin;
+	struct rdma_cm_id *id;
+	int ret;
+	pr_info("info 1");
+
+	ret = roswap_parse_server(&sin);
+	if (ret) {
+		pr_err("invalid server '%s', expect ip:port\n", server);
+		return ret;
+	}
+
+	init_completion(&conn->cm_done);
+	id = rdma_create_id(&init_net, roswap_cm_handler, conn, RDMA_PS_TCP,
+			    IB_QPT_RC);
+	if (IS_ERR(id))
+		return PTR_ERR(id);
+
+	ret = rdma_resolve_addr(id, NULL, (struct sockaddr *)&sin,
+				ROSWAP_CM_TIMEOUT_MS);
+	if (!ret)
+		ret = roswap_cm_wait(conn, RDMA_CM_EVENT_ADDR_RESOLVED);
+	if (ret)
+		goto err_id;
+	
+	pr_info("info 2");
+
+	reinit_completion(&conn->cm_done);
+	ret = rdma_resolve_route(id, ROSWAP_CM_TIMEOUT_MS);
+	if (!ret)
+		ret = roswap_cm_wait(conn, RDMA_CM_EVENT_ROUTE_RESOLVED);
+	if (ret)
+		goto err_id;
+
+
+	pr_info("info 3");
+
+	conn->pd = ib_alloc_pd(id->device, 0);
+	if (IS_ERR(conn->pd)) {
+		ret = PTR_ERR(conn->pd);
+		goto err_id;
+	}
+
+	conn->cq = ib_alloc_cq(id->device, conn, ROSWAP_QUEUE_DEPTH, 0,
+			       IB_POLL_SOFTIRQ);
+	if (IS_ERR(conn->cq)) {
+		ret = PTR_ERR(conn->cq);
+		goto err_pd;
+	}
+
+	qp_attr.send_cq = conn->cq;
+	qp_attr.recv_cq = conn->cq;
+	ret = rdma_create_qp(id, conn->pd, &qp_attr);
+	if (ret)
+		goto err_cq;
+
+	param.initiator_depth = min_t(int, id->device->attrs.max_qp_init_rd_atom,
+				      16);
+	reinit_completion(&conn->cm_done);
+	pr_info("info 4");
+	ret = rdma_connect(id, &param);
+	if (!ret)
+		ret = roswap_cm_wait(conn, RDMA_CM_EVENT_ESTABLISHED);
+	if (ret)
+		goto err_qp;
+
+	conn->cm_id = id;
+	WRITE_ONCE(conn->connected, true);
+	pr_info("connected to %s via %s\n", server, dev_name(&id->device->dev));
+	return 0;
+
+err_qp:
+	rdma_destroy_qp(id);
+err_cq:
+	ib_free_cq(conn->cq);
+err_pd:
+	ib_dealloc_pd(conn->pd);
+err_id:
+	rdma_destroy_id(id);
+	return ret;
+}
+
+
+
+
+
 
 static int roswap_add_disk(void)
 {
@@ -140,6 +308,15 @@ static int __init roswap_init(void)
 		return roswap_major_id;
 	}
 
+	if (server) {
+		ret = roswap_rdma_connect(&roswap_conn);
+		if (ret) {
+			pr_err("connect %s failed: %d\n",server,ret);
+			goto err_blkdev;
+		}
+	}
+
+
 	ret = roswap_add_disk();
 	if (ret) {
 		unregister_blkdev(roswap_major_id, "roswap");
@@ -149,24 +326,12 @@ static int __init roswap_init(void)
 
 	pr_info("added /dev/roswap0, major %d\n", roswap_major_id);
 	return 0;
+
+err_blkdev:
+	unregister_blkdev(roswap_major_id,"roswap");
+	return ret;
 }
 
-static int roswap_parse_server(struct sockaddr_in *sin)
-{
-	const char * end;
-	u16 port;
-	memset(sin, 0, sizeof(*sin));
-	
-	sin->sin_family = AF_INET;
-	
-	if (!in4_pton(server, -1, (u8 *)&sin->sin_addr.s_addr, ':', &end) ||
-		*end != ':' || kstrtou16(end + 1, 10, &port))
-		return -EINVAL;
-	
-	sin->sin_port = htons(port);
-
-	return 0;
-}
 
 static void __exit roswap_exit(void)
 {
