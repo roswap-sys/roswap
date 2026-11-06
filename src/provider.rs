@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::chunk::{Chunk, HeartbeatPage};
 use crate::rdma::{
-    sockaddr_from_v4, ConnPrivateData, PassiveConnection, QpPurpose, RdmaDeviceContext,
+    rdma_dev_ipv4, sockaddr_from_v4, ConnPrivateData, PassiveConnection, QpPurpose,
+    RdmaDeviceContext,
 };
 use crate::sys;
 use log::{debug, info, warn};
@@ -31,6 +32,7 @@ pub struct ProviderConfig {
     /// 空字符串或省略表示自动选择 RDMA 设备。
     #[serde(deserialize_with = "empty_string_as_none")]
     pub device_name: Option<String>,
+    /// `0.0.0.0` 只表示端口；实际会绑到所选 RDMA 设备的 IPv4，避免连接落到另一块设备上。
     pub listen_addr: SocketAddrV4,
     pub grpc_addr: SocketAddr,
     pub mem_dir: PathBuf,
@@ -75,6 +77,7 @@ impl ProviderRuntime {
         }
 
         let rdma = RdmaDeviceContext::open(config.device_name.as_deref())?;
+        let listen_addr = listen_addr_on_device(config.listen_addr, &rdma.dev_name)?;
         let boot_id_lo = read_boot_id_lo();
         let heartbeat = Arc::new(HeartbeatPage::new(
             rdma.pd(),
@@ -118,7 +121,7 @@ impl ProviderRuntime {
         }
         let listen_id = unsafe { NonNull::new_unchecked(raw_listen_id) };
 
-        let mut sin = sockaddr_from_v4(config.listen_addr);
+        let mut sin = sockaddr_from_v4(listen_addr);
         let rc = unsafe {
             sys::rdma_bind_addr(
                 listen_id.as_ptr(),
@@ -144,8 +147,25 @@ impl ProviderRuntime {
             return Err(err);
         }
 
+        let bound_verbs = unsafe { (*listen_id.as_ptr()).verbs };
+        if bound_verbs != rdma.context().as_ptr() {
+            unsafe {
+                let _ = sys::rdma_destroy_id(listen_id.as_ptr());
+                sys::rdma_destroy_event_channel(channel.as_ptr());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "listen {listen_addr} is not on RDMA device {}",
+                    rdma.dev_name
+                ),
+            ));
+        }
+
+        let mut config = config.clone();
+        config.listen_addr = listen_addr;
         Ok(Self {
-            config: config.clone(),
+            config,
             rdma,
             heartbeat,
             chunks,
@@ -278,6 +298,15 @@ impl ProviderRuntime {
                 (QpPurpose::Bulk, 0, 0)
             };
 
+        let id_verbs = unsafe { (*client_id.as_ptr()).verbs };
+        let pd_ctx = unsafe { (*self.rdma.pd().as_ptr()).context };
+        if id_verbs != pd_ctx {
+            return Err(format!(
+                "connection arrived on a different RDMA device than {}",
+                self.rdma.dev_name
+            ));
+        }
+
         let mut qp_attr = sys::ibv_qp_init_attr {
             qp_context: std::ptr::null_mut(),
             send_cq: self.rdma.shared_cq().as_ptr(),
@@ -364,6 +393,19 @@ impl Drop for ProviderRuntime {
             sys::rdma_destroy_event_channel(self.channel.as_ptr());
         }
     }
+}
+
+fn listen_addr_on_device(listen_addr: SocketAddrV4, dev_name: &str) -> io::Result<SocketAddrV4> {
+    if !listen_addr.ip().is_unspecified() {
+        return Ok(listen_addr);
+    }
+    let ip = rdma_dev_ipv4(dev_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("RDMA device {dev_name} has no IPv4 address"),
+        )
+    })?;
+    Ok(SocketAddrV4::new(ip, listen_addr.port()))
 }
 
 fn read_boot_id_lo() -> u64 {
