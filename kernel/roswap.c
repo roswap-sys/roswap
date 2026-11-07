@@ -344,6 +344,7 @@ static void __exit roswap_exit(void)
 	roswap_cleanup_disk(roswap_disk);
 	roswap_disk = NULL;
 	blk_mq_free_tag_set(&roswap_tag_set);
+	roswap_rdma_disconnect(&roswap_conn);
 	unregister_blkdev(roswap_major_id, "roswap");
 	pr_info("unregistered roswap major %d\n", roswap_major_id);
 }
