@@ -88,6 +88,66 @@ impl ConnPrivateData {
     pub fn node_epoch(&self) -> u32 {
         u32::from_be(self.node_epoch_be)
     }
+
+    /// `rsvd2[0]`，单位 MiB。头长仍是 48 字节。
+    pub fn set_chunk_size_mb(&mut self, mb: u32) {
+        self.rsvd2[0] = mb.to_be();
+    }
+
+    pub fn chunk_size_mb(&self) -> u32 {
+        u32::from_be(self.rsvd2[0])
+    }
+}
+
+pub fn chunk_size_error(advertised_mb: u32, chunk_bytes: usize) -> Option<&'static str> {
+    if advertised_mb == 0 {
+        return Some("client did not advertise chunk_size_mb");
+    }
+    let actual_mb = (chunk_bytes >> 20) as u32;
+    if chunk_bytes != (actual_mb as usize) << 20 || advertised_mb != actual_mb {
+        return Some("chunk_size_mb mismatch");
+    }
+    None
+}
+
+/// 这些事件之后 QP 不会进入 ESTABLISHED，或者已经离开。调用方要把连接从映射里拿走。
+pub fn cm_event_drops_connection(event: u32) -> bool {
+    matches!(
+        event,
+        sys::RDMA_CM_EVENT_ADDR_ERROR
+            | sys::RDMA_CM_EVENT_ROUTE_ERROR
+            | sys::RDMA_CM_EVENT_CONNECT_ERROR
+            | sys::RDMA_CM_EVENT_UNREACHABLE
+            | sys::RDMA_CM_EVENT_REJECTED
+            | sys::RDMA_CM_EVENT_DISCONNECTED
+            | sys::RDMA_CM_EVENT_DEVICE_REMOVAL
+            | sys::RDMA_CM_EVENT_TIMEWAIT_EXIT
+    )
+}
+
+pub struct CmEventView {
+    pub id: *mut sys::rdma_cm_id,
+    pub event: u32,
+    pub status: i32,
+    pub private_data: Option<ConnPrivateData>,
+}
+
+/// `rdma_ack_cm_event` 会释放事件和它的 private_data。必须在 ack 之前把要用的字节拷出来。
+pub unsafe fn snapshot_cm_event(raw: *const sys::rdma_cm_event) -> CmEventView {
+    let ev = &*raw;
+    CmEventView {
+        id: ev.id,
+        event: ev.event,
+        status: ev.status,
+        private_data: copy_conn_private(ev.conn.private_data, ev.conn.private_data_len),
+    }
+}
+
+unsafe fn copy_conn_private(ptr: *const std::ffi::c_void, len: u8) -> Option<ConnPrivateData> {
+    if ptr.is_null() || (len as usize) < std::mem::size_of::<ConnPrivateData>() {
+        return None;
+    }
+    Some(std::ptr::read_unaligned(ptr as *const ConnPrivateData))
 }
 
 pub struct RdmaDeviceContext {
@@ -234,6 +294,7 @@ unsafe impl Send for PassiveConnection {}
 impl Drop for PassiveConnection {
     fn drop(&mut self) {
         unsafe {
+            let _ = sys::rdma_disconnect(self.cm_id.as_ptr());
             if !(*self.cm_id.as_ptr()).qp.is_null() {
                 sys::rdma_destroy_qp(self.cm_id.as_ptr());
             }
@@ -312,5 +373,91 @@ fn ipv4_of_interface(ifname: &str) -> Option<Ipv4Addr> {
         }
         let octets = ifr.ifr_addr.sin_addr.s_addr.to_ne_bytes();
         Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    fn event_with_private(pdata: *const ConnPrivateData, len: u8) -> sys::rdma_cm_event {
+        sys::rdma_cm_event {
+            id: std::ptr::null_mut(),
+            listen_id: std::ptr::null_mut(),
+            event: sys::RDMA_CM_EVENT_CONNECT_REQUEST,
+            status: 0,
+            conn: sys::rdma_conn_param {
+                private_data: pdata as *const c_void,
+                private_data_len: len,
+                responder_resources: 0,
+                initiator_depth: 0,
+                flow_control: 0,
+                retry_count: 0,
+                rnr_retry_count: 0,
+                srq: 0,
+                qp_num: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_private_data_after_the_source_is_overwritten() {
+        let mut pdata = ConnPrivateData::new(QpPurpose::Fault, 2, 9, 3);
+        pdata.set_chunk_size_mb(512);
+        let ev = event_with_private(&pdata, std::mem::size_of::<ConnPrivateData>() as u8);
+        let snap = unsafe { snapshot_cm_event(&ev) };
+        pdata.magic_be = 0;
+        pdata.rsvd2 = [0; 2];
+        let copied = snap.private_data.expect("private data copied before ack");
+        assert_eq!(pdata.chunk_size_mb(), 0);
+        assert_eq!(copied.cpu(), 2);
+        assert_eq!(copied.node_id(), 9);
+        assert_eq!(copied.chunk_size_mb(), 512);
+        assert_ne!(copied.chunk_size_mb(), pdata.chunk_size_mb());
+        assert_eq!(copied.validate(Some(3)).unwrap(), QpPurpose::Fault);
+    }
+
+    #[test]
+    fn snapshot_drops_missing_or_short_private_data() {
+        let ev = event_with_private(std::ptr::null(), 0);
+        let snap = unsafe { snapshot_cm_event(&ev) };
+        assert!(snap.private_data.is_none());
+
+        let pdata = ConnPrivateData::new(QpPurpose::Bulk, 0, 0, 0);
+        let ev = event_with_private(&pdata, 8);
+        let snap = unsafe { snapshot_cm_event(&ev) };
+        assert!(snap.private_data.is_none());
+    }
+
+    #[test]
+    fn chunk_size_must_match_the_exported_mr() {
+        assert_eq!(
+            chunk_size_error(0, 64 << 20),
+            Some("client did not advertise chunk_size_mb")
+        );
+        assert_eq!(
+            chunk_size_error(64, 512 << 20),
+            Some("chunk_size_mb mismatch")
+        );
+        assert_eq!(chunk_size_error(512, 512 << 20), None);
+        assert_eq!(
+            chunk_size_error(512, (512 << 20) + 4096),
+            Some("chunk_size_mb mismatch")
+        );
+    }
+
+    #[test]
+    fn terminal_cm_events_drop_the_connection() {
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_DISCONNECTED));
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_CONNECT_ERROR));
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_REJECTED));
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_UNREACHABLE));
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_DEVICE_REMOVAL));
+        assert!(cm_event_drops_connection(sys::RDMA_CM_EVENT_TIMEWAIT_EXIT));
+        assert!(!cm_event_drops_connection(sys::RDMA_CM_EVENT_ESTABLISHED));
+        assert!(!cm_event_drops_connection(
+            sys::RDMA_CM_EVENT_CONNECT_REQUEST
+        ));
     }
 }

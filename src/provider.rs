@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::chunk::{Chunk, HeartbeatPage};
 use crate::rdma::{
-    rdma_dev_ipv4, sockaddr_from_v4, ConnPrivateData, PassiveConnection, QpPurpose,
-    RdmaDeviceContext,
+    chunk_size_error, cm_event_drops_connection, rdma_dev_ipv4, snapshot_cm_event,
+    sockaddr_from_v4, CmEventView, ConnPrivateData, PassiveConnection, RdmaDeviceContext,
 };
 use crate::sys;
 use log::{debug, info, warn};
@@ -39,7 +39,6 @@ pub struct ProviderConfig {
     pub chunk_size_mb: usize,
     pub num_chunks: usize,
     pub node_epoch: u32,
-
 }
 
 impl Default for ProviderConfig {
@@ -67,8 +66,6 @@ pub struct ProviderRuntime {
 }
 
 unsafe impl Send for ProviderRuntime {}
-
-
 
 impl ProviderRuntime {
     pub fn init(config: &ProviderConfig) -> io::Result<Self> {
@@ -228,7 +225,8 @@ impl ProviderRuntime {
             return Err(io::Error::last_os_error());
         }
 
-        let ev = unsafe { *raw_ev };
+        // ack 会释放事件以及 private_data 缓冲，所以先把要用的字段拷到自己的内存里。
+        let ev = unsafe { snapshot_cm_event(raw_ev) };
         unsafe {
             let _ = sys::rdma_ack_cm_event(raw_ev);
         }
@@ -237,14 +235,14 @@ impl ProviderRuntime {
         Ok(true)
     }
 
-    fn handle_cm_event(&mut self, ev: sys::rdma_cm_event) -> io::Result<()> {
+    fn handle_cm_event(&mut self, ev: CmEventView) -> io::Result<()> {
         match ev.event {
             sys::RDMA_CM_EVENT_CONNECT_REQUEST => {
                 let client_id = match NonNull::new(ev.id) {
                     Some(id) => id,
                     None => return Ok(()),
                 };
-                if let Err(msg) = self.accept_client(client_id, &ev.conn) {
+                if let Err(msg) = self.accept_client(client_id, ev.private_data) {
                     warn!("rejected connection: {msg}");
                     unsafe {
                         let _ = sys::rdma_reject(client_id.as_ptr(), std::ptr::null(), 0);
@@ -260,17 +258,8 @@ impl ProviderRuntime {
                     );
                 }
             }
-            sys::RDMA_CM_EVENT_DISCONNECTED => {
-                let key = ev.id as usize;
-                if let Some(conn) = self.conns.remove(&key) {
-                    info!(
-                        "connection disconnected purpose={:?} cpu={} node_id={}",
-                        conn.purpose, conn.cpu, conn.node_id
-                    );
-                    unsafe {
-                        let _ = sys::rdma_disconnect(conn.cm_id.as_ptr());
-                    }
-                }
+            event if cm_event_drops_connection(event) => {
+                self.drop_connection(ev.id as usize);
             }
             _ => {
                 debug!("ignored cm event {} status {}", ev.event, ev.status);
@@ -279,24 +268,38 @@ impl ProviderRuntime {
         Ok(())
     }
 
+    fn drop_connection(&mut self, key: usize) {
+        if let Some(conn) = self.conns.remove(&key) {
+            info!(
+                "connection dropped purpose={:?} cpu={} node_id={}",
+                conn.purpose, conn.cpu, conn.node_id
+            );
+        }
+    }
+
     fn accept_client(
         &mut self,
         client_id: NonNull<sys::rdma_cm_id>,
-        conn_param: &sys::rdma_conn_param,
+        pdata: Option<ConnPrivateData>,
     ) -> Result<(), String> {
-        let (purpose, cpu, node_id) =
-            if !conn_param.private_data.is_null()
-                && (conn_param.private_data_len as usize) >= std::mem::size_of::<ConnPrivateData>()
-            {
-                let pdata =
-                    unsafe { *(conn_param.private_data as *const ConnPrivateData) };
-                let purpose = pdata
-                    .validate(Some(self.config.node_epoch))
-                    .map_err(|e| e.to_string())?;
-                (purpose, pdata.cpu(), pdata.node_id())
-            } else {
-                (QpPurpose::Bulk, 0, 0)
-            };
+        let pdata = pdata.ok_or("missing rs_conn_pdata")?;
+        let purpose = pdata
+            .validate(Some(self.config.node_epoch))
+            .map_err(|e| e.to_string())?;
+        let chunk_bytes = self
+            .chunks
+            .first()
+            .map(|chunk| chunk.len())
+            .ok_or("no chunk exported")?;
+        if let Some(reason) = chunk_size_error(pdata.chunk_size_mb(), chunk_bytes) {
+            return Err(format!(
+                "{reason}: client {} MiB, provider {} MiB",
+                pdata.chunk_size_mb(),
+                chunk_bytes >> 20
+            ));
+        }
+        let cpu = pdata.cpu();
+        let node_id = pdata.node_id();
 
         let id_verbs = unsafe { (*client_id.as_ptr()).verbs };
         let pd_ctx = unsafe { (*self.rdma.pd().as_ptr()).context };
@@ -410,7 +413,11 @@ fn listen_addr_on_device(listen_addr: SocketAddrV4, dev_name: &str) -> io::Resul
 
 fn read_boot_id_lo() -> u64 {
     if let Ok(s) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
-        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).take(16).collect();
+        let hex: String = s
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(16)
+            .collect();
         if let Ok(v) = u64::from_str_radix(&hex, 16) {
             return v;
         }
@@ -421,14 +428,119 @@ fn read_boot_id_lo() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rdma::local_rdma_ipv4;
+    use crate::rdma::{local_rdma_ipv4, QpPurpose};
     use std::ffi::c_void;
     use std::net::Ipv4Addr;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let base = std::env::var("ROSWAP_CHUNK_DIR").unwrap_or_else(|_| "/dev/shm".to_string());
+        PathBuf::from(base).join(name)
+    }
+
+    fn mount_huge_mode(dir: &Path) -> Option<String> {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let text = fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let mut best: Option<(usize, String)> = None;
+        for line in text.lines() {
+            let Some((left, right)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mountpoint = left.split_whitespace().nth(4)?;
+            let superopts = right.split_whitespace().nth(2).unwrap_or("");
+            if !dir.starts_with(mountpoint) {
+                continue;
+            }
+            let Some(mode) = superopts
+                .split(',')
+                .find_map(|opt| opt.strip_prefix("huge="))
+            else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .map(|(len, _)| mountpoint.len() > *len)
+                .unwrap_or(true)
+            {
+                best = Some((mountpoint.len(), mode.to_string()));
+            }
+        }
+        best.map(|(_, mode)| mode)
+    }
+
+    fn expect_huge_pages(dir: &Path) -> bool {
+        if let Some(mode) = mount_huge_mode(dir) {
+            return matches!(mode.as_str(), "always" | "advise" | "within_size" | "force");
+        }
+        let enabled = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+            .unwrap_or_default();
+        ["[always]", "[advise]", "[within_size]", "[force]"]
+            .iter()
+            .any(|flag| enabled.contains(flag))
+    }
+
+    fn shmem_pmd_mapped_kb(path: &Path) -> u64 {
+        let text = fs::read_to_string("/proc/self/smaps").unwrap();
+        let needle = path.to_string_lossy();
+        let mut in_region = false;
+        for line in text.lines() {
+            // 映射头是 "addr-addr rw-s ... path"。设备号里也有冒号，不能靠冒号区分。
+            if smaps_header(line) {
+                in_region = line.contains(needle.as_ref());
+                continue;
+            }
+            if in_region {
+                if let Some(rest) = line.strip_prefix("ShmemPmdMapped:") {
+                    return rest.split_whitespace().next().unwrap().parse().unwrap();
+                }
+            }
+        }
+        0
+    }
+
+    fn smaps_header(line: &str) -> bool {
+        let Some(range) = line.split_whitespace().next() else {
+            return false;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return false;
+        };
+        !start.is_empty()
+            && !end.is_empty()
+            && start.chars().all(|c| c.is_ascii_hexdigit())
+            && end.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    fn resident_pages(addr: *const u8, len: usize) -> usize {
+        let pages = len / crate::chunk::PAGE_SIZE;
+        let mut vec = vec![0u8; pages];
+        let rc = unsafe { sys::mincore(addr as *mut _, len, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        vec.iter().filter(|b| *b & 1 == 1).count()
+    }
+
+    #[test]
+    fn reopen_rejects_a_different_length() {
+        let rdma = RdmaDeviceContext::open(None).expect("open RDMA device");
+        let test_dir = test_dir("roswap-test-chunk-len");
+        let _ = fs::remove_dir_all(&test_dir);
+        {
+            let chunk =
+                Chunk::create(rdma.pd(), &test_dir, 1, 1, 4 << 20).expect("create 4MB chunk");
+            drop(chunk);
+        }
+        match Chunk::create(rdma.pd(), &test_dir, 1, 1, 8 << 20) {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("different length was accepted"),
+        }
+        let _ = fs::remove_dir_all(&test_dir);
+    }
 
     #[test]
     fn test_chunk_mr_and_persistence_across_reopen() {
         let rdma = RdmaDeviceContext::open(None).expect("open RDMA device");
-        let test_dir = PathBuf::from("/dev/shm/roswap-test-chunk");
+        let test_dir = test_dir("roswap-test-chunk");
         let _ = fs::remove_dir_all(&test_dir);
 
         let rkey_first;
@@ -437,6 +549,19 @@ mod tests {
                 Chunk::create(rdma.pd(), &test_dir, 7, 1, 4 << 20).expect("create 4MB chunk");
             assert_ne!(chunk.rkey(), 0);
             assert_ne!(chunk.lkey(), 0);
+            let blocks = fs::metadata(&chunk.file_path).unwrap().blocks();
+            assert!(blocks * 512 >= chunk.len() as u64);
+            assert_eq!(
+                resident_pages(chunk.as_slice().as_ptr(), chunk.len()),
+                chunk.len() / 4096
+            );
+            if expect_huge_pages(&test_dir) {
+                let kb = shmem_pmd_mapped_kb(&chunk.file_path);
+                assert!(
+                    kb * 1024 >= (2 << 20),
+                    "ShmemPmdMapped is {kb} kB; MADV_HUGEPAGE did not allocate a huge page"
+                );
+            }
             rkey_first = chunk.rkey();
             chunk.as_mut_slice()[0..8].copy_from_slice(b"ROSWAP01");
         }
@@ -460,7 +585,7 @@ mod tests {
         let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18599);
         let connect_addr = SocketAddrV4::new(target_ip, 18599);
         let grpc_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 12220));
-        let test_dir = PathBuf::from("/dev/shm/roswap-test-rdma");
+        let test_dir = test_dir("roswap-test-rdma");
         let _ = fs::remove_dir_all(&test_dir);
 
         let cfg = ProviderConfig {
@@ -547,7 +672,8 @@ mod tests {
             };
             assert_eq!(sys::rdma_create_qp(cid, pd, &mut qp_attr), 0);
 
-            let pdata = ConnPrivateData::new(QpPurpose::Fault, 0, 1, 3);
+            let mut pdata = ConnPrivateData::new(QpPurpose::Fault, 0, 1, 3);
+            pdata.set_chunk_size_mb(cfg.chunk_size_mb as u32);
             let mut conn_param = sys::rdma_conn_param {
                 private_data: &pdata as *const ConnPrivateData as *const c_void,
                 private_data_len: std::mem::size_of::<ConnPrivateData>() as u8,

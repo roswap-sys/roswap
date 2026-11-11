@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 log = "0.4"
 prost = "0.14"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tonic = "0.14"
 tonic-prost = "0.14"
 tracing = { version = "0.1", default-features = false, features = ["std"] }

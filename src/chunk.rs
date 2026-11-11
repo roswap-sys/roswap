@@ -45,14 +45,27 @@ impl Chunk {
             .create(true)
             .truncate(false)
             .open(&file_path)?;
-        file.set_len(len as u64)?;
+        let existing = file.metadata()?.len();
+        if existing == 0 {
+            // ftruncate 只改长度。fallocate 会先按 4K 把页分配出来，MADV_HUGEPAGE 就不起作用。
+            file.set_len(len as u64)?;
+        } else if existing != len as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "chunk file {} is {existing} bytes, expected {len}",
+                    file_path.display()
+                ),
+            ));
+        }
 
+        // 先映射、再给大页提示、最后才 fault。MAP_POPULATE 会在提示之前按 4K 把页填上。
         let raw_addr = unsafe {
             sys::mmap(
                 std::ptr::null_mut(),
                 len,
                 sys::PROT_READ | sys::PROT_WRITE,
-                sys::MAP_SHARED | sys::MAP_POPULATE,
+                sys::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )
@@ -64,10 +77,14 @@ impl Chunk {
 
         unsafe {
             let _ = sys::madvise(addr.as_ptr(), len, sys::MADV_HUGEPAGE);
+            if sys::madvise(addr.as_ptr(), len, sys::MADV_POPULATE_WRITE) != 0 {
+                prefault_after_huge_hint(addr.as_ptr() as *mut u8, len);
+            }
         }
 
-        let access =
-            sys::IBV_ACCESS_LOCAL_WRITE | sys::IBV_ACCESS_REMOTE_READ | sys::IBV_ACCESS_REMOTE_WRITE;
+        let access = sys::IBV_ACCESS_LOCAL_WRITE
+            | sys::IBV_ACCESS_REMOTE_READ
+            | sys::IBV_ACCESS_REMOTE_WRITE;
         let raw_mr = unsafe { sys::ibv_reg_mr(pd.as_ptr(), addr.as_ptr(), len, access) };
         let mr = match NonNull::new(raw_mr) {
             Some(mr) => mr,
@@ -118,6 +135,17 @@ impl Chunk {
         let path = self.file_path.clone();
         drop(self);
         fs::remove_file(path)
+    }
+}
+
+fn prefault_after_huge_hint(addr: *mut u8, len: usize) {
+    let mut off = 0;
+    while off < len {
+        unsafe {
+            let ptr = addr.add(off);
+            std::ptr::write_volatile(ptr, std::ptr::read_volatile(ptr));
+        }
+        off += PAGE_SIZE;
     }
 }
 

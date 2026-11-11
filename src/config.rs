@@ -43,27 +43,43 @@ impl Config {
     }
 }
 
-/* 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddrV4;
+    use std::net::{SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
 
     #[test]
-    fn repo_config_parses() {
-        let cfg: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+    fn full_provider_config_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            role = "provider"
+
+            [provider]
+            device_name = ""
+            listen_addr = "0.0.0.0:18515"
+            grpc_addr = "0.0.0.0:12220"
+            mem_dir = "/dev/shm/roswap"
+            chunk_size_mb = 256
+            num_chunks = 2
+            node_epoch = 3
+            "#,
+        )
+        .unwrap();
         assert_eq!(cfg.role, Role::Provider);
         assert_eq!(cfg.provider.device_name, None);
         assert_eq!(
             cfg.provider.listen_addr,
             "0.0.0.0:18515".parse::<SocketAddrV4>().unwrap()
         );
+        assert_eq!(
+            cfg.provider.grpc_addr,
+            "0.0.0.0:12220".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(cfg.provider.mem_dir, PathBuf::from("/dev/shm/roswap"));
-        assert_eq!(cfg.provider.chunk_size_mb, 64);
-        assert_eq!(cfg.provider.num_chunks, 1);
-        assert_eq!(cfg.provider.node_epoch, 1);
+        assert_eq!(cfg.provider.chunk_size_mb, 256);
+        assert_eq!(cfg.provider.num_chunks, 2);
+        assert_eq!(cfg.provider.node_epoch, 3);
     }
 
     #[test]
@@ -91,4 +107,3 @@ mod tests {
         assert!(err.to_string().contains("extra"));
     }
 }
-*/

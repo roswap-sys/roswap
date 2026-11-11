@@ -10,6 +10,9 @@ pub const MAP_SHARED: c_int = 0x01;
 pub const MAP_POPULATE: c_int = 0x08000;
 pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 pub const MADV_HUGEPAGE: c_int = 14;
+pub const MADV_POPULATE_WRITE: c_int = 23;
+pub const SIGINT: c_int = 2;
+pub const SIGTERM: c_int = 15;
 pub const MCL_CURRENT: c_int = 1;
 pub const MCL_FUTURE: c_int = 2;
 pub const POLLIN: i16 = 0x0001;
@@ -37,6 +40,8 @@ pub const RDMA_CM_EVENT_UNREACHABLE: c_uint = 7;
 pub const RDMA_CM_EVENT_REJECTED: c_uint = 8;
 pub const RDMA_CM_EVENT_ESTABLISHED: c_uint = 9;
 pub const RDMA_CM_EVENT_DISCONNECTED: c_uint = 10;
+pub const RDMA_CM_EVENT_DEVICE_REMOVAL: c_uint = 11;
+pub const RDMA_CM_EVENT_TIMEWAIT_EXIT: c_uint = 15;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -386,7 +391,9 @@ extern "C" {
     ) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, length: usize) -> c_int;
     pub fn madvise(addr: *mut c_void, length: usize, advice: c_int) -> c_int;
+    pub fn mincore(addr: *mut c_void, length: usize, vec: *mut u8) -> c_int;
     pub fn mlockall(flags: c_int) -> c_int;
+    pub fn signal(signum: c_int, handler: Option<unsafe extern "C" fn(c_int)>) -> usize;
     pub fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> c_int;
     pub fn free(ptr: *mut c_void);
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;

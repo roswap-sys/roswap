@@ -1,61 +1,68 @@
 // SPDX-License-Identifier: GPL-2.0
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 tonic::include_proto!("roswap");
 
 pub struct Info;
 
 #[tonic::async_trait]
-impl provider_service_server::ProviderService for Info{
-    async fn get_info(&self, _request: Request<GetInfoRequest>)->Result<Response<GetInfoResponse>,Status>{
-        Ok(Response::new(GetInfoResponse { version: "info version: 1.0.0".to_string() }))
+impl provider_service_server::ProviderService for Info {
+    async fn get_info(
+        &self,
+        _request: Request<GetInfoRequest>,
+    ) -> Result<Response<GetInfoResponse>, Status> {
+        Ok(Response::new(GetInfoResponse {
+            version: "info version: 1.0.0".to_string(),
+        }))
     }
 }
 
+pub async fn serve_provider(
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+) -> Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(provider_service_server::ProviderServiceServer::new(Info))
+        .serve_with_shutdown(addr, wait_stop(stop))
+        .await
+}
 
-
-
-
-
-
-
-
-
-
+async fn wait_stop(stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::provider_service_client::ProviderServiceClient;
-    use super::provider_service_server::{ProviderService, ProviderServiceServer};
-    use super::{GetInfoRequest, GetInfoResponse};
+    use super::provider_service_server::ProviderServiceServer;
+    use super::{serve_provider, GetInfoRequest, Info};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
-    use tonic::{Request, Response, Status};
-
-    struct Info;
-
-    #[tonic::async_trait]
-    impl ProviderService for Info {
-        async fn get_info(
-            &self,
-            _request: Request<GetInfoRequest>,
-        ) -> Result<Response<GetInfoResponse>, Status> {
-            Ok(Response::new(GetInfoResponse {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            }))
-        }
-    }
+    use tonic::Request;
 
     #[tokio::test]
-    async fn get_info_loopback() {
+    async fn get_info_uses_the_real_service_and_stops() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(ProviderServiceServer::new(Info))
-                .serve_with_incoming(TcpListenerStream::new(listener))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    super::wait_stop(stop_srv),
+                )
                 .await
-                .unwrap();
         });
 
         let mut client = ProviderServiceClient::connect(format!("http://{addr}"))
@@ -66,6 +73,28 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(response.version, "info version: 1.0.0");
+
+        stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server did not stop")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_provider_returns_when_stop_is_set() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let server = tokio::spawn(async move { serve_provider(addr, stop_srv).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("serve_provider did not return")
+            .unwrap()
+            .unwrap();
     }
 }
