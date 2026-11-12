@@ -12,9 +12,13 @@
 
 typedef struct { int unused; } spinlock_t;
 
+/*
+ * 故意不提供 spin_lock/spin_unlock。m->lock 会在 RDMA 完成回调里被拿，
+ * 进程上下文必须关中断，map.c 里写了裸 spin_lock 就让 map-test 编不过。
+ */
 #define spin_lock_init(l)	((void)(l))
-#define spin_lock(l)		((void)(l))
-#define spin_unlock(l)		((void)(l))
+#define spin_lock_irqsave(l, f)		((void)(l), (f) = 0)
+#define spin_unlock_irqrestore(l, f)	((void)(l), (void)(f))
 #define GFP_KERNEL		0
 #define kvzalloc(sz, gfp)	calloc(1, (sz))
 #define kvfree(p)		free(p)

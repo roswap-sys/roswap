@@ -41,6 +41,13 @@ static inline struct gendisk *roswap_alloc_disk(struct blk_mq_tag_set *set)
 }
 #endif
 
+/* 6.0 去掉了 busy_tag_iter_fn 的 reserved 参数。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#define ROSWAP_BUSY_ITER_ARGS struct request *rq, void *data
+#else
+#define ROSWAP_BUSY_ITER_ARGS struct request *rq, void *data, bool reserved
+#endif
+
 static inline void roswap_apply_queue_limits(struct gendisk *disk)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)

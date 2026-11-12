@@ -29,3 +29,6 @@ jobs:
 
     - name: Build kernel module
       run: make -C kernel
+
+    - name: Map allocator tests
+      run: make -C kernel map-test

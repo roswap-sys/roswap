@@ -102,6 +102,8 @@ static void rs_fault_poll_work(struct work_struct *work);
 static void rs_connect_rest(struct work_struct *work);
 static void rs_link_failed(struct rs_qp *qp);
 static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc);
+static void rs_fail_request(struct rs_qp *qp, struct request *rq);
+static void rs_reap_orphans(struct rs_qp *qp, struct ib_device *dev);
 
 static unsigned int rs_primary_cpu(void)
 {
@@ -189,24 +191,25 @@ static bool rs_wc_permanent(enum ib_wc_status status)
 	}
 }
 
-static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd)
+/*
+ * done 在 post 之前就挂到 cmd 上。完成可能被别的轮询者先收走，
+ * 之后 cmd 会被复用，post 之后再碰 cmd 就是写别人的请求。
+ */
+static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd, bool *done)
 {
-	bool done = false;
 	unsigned long flags;
 	ktime_t end = ktime_add_us(ktime_get(), ROSWAP_FAULT_POLL_US);
 
-	cmd->done_flag = &done;
 	spin_lock_irqsave(&qp->poll_lock, flags);
-	do {
+	while (!*done && ktime_before(ktime_get(), end)) {
 		ib_process_cq_direct(qp->cq, 16);
-		if (done)
-			break;
-		cpu_relax();
-	} while (ktime_before(ktime_get(), end));
-	if (!done)
+		if (!*done)
+			cpu_relax();
+	}
+	if (!*done)
 		cmd->done_flag = NULL;
 	spin_unlock_irqrestore(&qp->poll_lock, flags);
-	if (!done && atomic_read(&qp->state) == RS_LINK_UP)
+	if (!*done && atomic_read(&qp->state) == RS_LINK_UP)
 		queue_work(roswap_wq, &qp->poll_work);
 }
 
@@ -222,6 +225,7 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct ib_sge sge;
 	struct bio_vec bv;
 	bool read = req_op(rq) == REQ_OP_READ;
+	bool done = false;
 	u64 off;
 	int ret;
 
@@ -264,18 +268,20 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	rcu_read_lock();
 	link = rs_link_find(remote.node_id);
-	qp = rs_qp_for(link, smp_processor_id(), read);
+	/* 只用来挑 QP，被迁走也没关系；queue_rq 不保证关抢占。 */
+	qp = rs_qp_for(link, raw_smp_processor_id(), read);
 	rcu_read_unlock();
 	if (!qp || !qp->cm_id || atomic_read(&qp->state) != RS_LINK_UP) {
 		rs_map_finish(off);
-		if (!qp || READ_ONCE(link->fatal))
+		/* stop 之后没人会再拉起链路，返回 RESOURCE 会让 del_gendisk 永远等。 */
+		if (!qp || READ_ONCE(link->fatal) || READ_ONCE(qp->stop))
 			return BLK_STS_IOERR;
 		rs_qp_kick(qp);
 		return BLK_STS_RESOURCE;
 	}
 
 	cmd->qp = qp;
-	cmd->done_flag = NULL;
+	cmd->done_flag = qp->poll_direct ? &done : NULL;
 	cmd->off = off;
 	cmd->len = bv.bv_len;
 	cmd->gid = remote.gid;
@@ -308,11 +314,11 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 		atomic_dec(&qp->inflight);
 		rs_map_finish(off);
 		rs_link_failed(qp);
-		blk_mq_requeue_request(rq, false);
+		blk_mq_requeue_request(rq, true);
 		return BLK_STS_OK;
 	}
 	if (qp->poll_direct)
-		rs_fault_poll(qp, cmd);
+		rs_fault_poll(qp, cmd, &done);
 	return BLK_STS_OK;
 }
 
@@ -338,15 +344,58 @@ static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		if (rs_wc_permanent(wc->status) &&
 		    rs_map_chunk_gen(cmd->gid) == cmd->gen)
-			qp->key_wait = true;
+			WRITE_ONCE(qp->key_wait, true);
 		rs_link_failed(qp);
-		if (READ_ONCE(qp->link->fatal) ||
-		    atomic_read(&qp->state) == RS_LINK_OFF)
-			blk_mq_end_request(rq, BLK_STS_IOERR);
-		else
-			blk_mq_requeue_request(rq, false);
+		rs_fail_request(qp, rq);
 	}
 	atomic_dec(&qp->inflight);
+}
+
+/* 链路已经放弃就报错，否则交回 blk-mq 等链路恢复后重发。 */
+static void rs_fail_request(struct rs_qp *qp, struct request *rq)
+{
+	if (READ_ONCE(qp->stop) || READ_ONCE(qp->link->fatal) ||
+	    atomic_read(&qp->state) == RS_LINK_OFF)
+		blk_mq_end_request(rq, BLK_STS_IOERR);
+	else
+		blk_mq_requeue_request(rq, true);
+}
+
+struct rs_reap_ctx {
+	struct rs_qp *qp;
+	struct ib_device *dev;
+	int n;
+};
+
+static bool rs_reap_one(ROSWAP_BUSY_ITER_ARGS)
+{
+	struct rs_reap_ctx *ctx = data;
+	struct roswap_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	if (cmd->qp != ctx->qp)
+		return true;
+	ib_dma_unmap_page(ctx->dev, cmd->dma, cmd->len, cmd->dir);
+	rs_map_finish(cmd->off);
+	rs_fail_request(ctx->qp, rq);
+	atomic_dec(&ctx->qp->inflight);
+	ctx->n++;
+	return true;
+}
+
+/*
+ * QP 和 CQ 都已销毁，硬件不会再 DMA，也不会再有完成回调。
+ * 还挂在这个 QP 上的请求只能由这里结束，否则提交者永远停在 D 状态，
+ * 对应的槽位也一直 BUSY。调用方必须保证没有 queue_rq 在跑。
+ */
+static void rs_reap_orphans(struct rs_qp *qp, struct ib_device *dev)
+{
+	struct rs_reap_ctx ctx = { .qp = qp, .dev = dev };
+
+	if (!roswap_disk || atomic_read(&qp->inflight) <= 0)
+		return;
+	blk_mq_tagset_busy_iter(&roswap_tag_set, rs_reap_one, &ctx);
+	pr_err("cpu %u failed %d requests left on a dead QP\n", qp->cpu, ctx.n);
+	atomic_set(&qp->inflight, 0);
 }
 
 static const struct blk_mq_ops roswap_mq_ops = {
@@ -536,6 +585,7 @@ err_id:
 
 static void rs_qp_teardown(struct rs_qp *qp)
 {
+	struct ib_device *dev;
 	unsigned long end;
 
 	if (!qp->cm_id)
@@ -555,8 +605,10 @@ static void rs_qp_teardown(struct rs_qp *qp)
 	if (atomic_read(&qp->inflight) > 0)
 		pr_err("cpu %u drained with %d requests still in flight\n",
 		       qp->cpu, atomic_read(&qp->inflight));
+	dev = qp->cm_id->device;
 	rdma_destroy_qp(qp->cm_id);
 	ib_free_cq(qp->cq);
+	rs_reap_orphans(qp, dev);
 	rdma_destroy_id(qp->cm_id);
 	qp->cm_id = NULL;
 	qp->cq = NULL;
@@ -616,7 +668,7 @@ static void rs_qp_recover(struct work_struct *work)
 
 	if (READ_ONCE(qp->stop))
 		goto out;
-	if (qp->key_wait) {
+	if (READ_ONCE(qp->key_wait)) {
 		u32 seen = READ_ONCE(qp->link->key_gen);
 
 		if (!qp->recover_deadline)
@@ -629,11 +681,12 @@ static void rs_qp_recover(struct work_struct *work)
 					   HZ);
 		if (rs_give_up(qp))
 			goto fail;
-		qp->key_wait = false;
+		WRITE_ONCE(qp->key_wait, false);
 	}
 
 	mutex_lock(&rs_qp_mu);
-	if (!qp->key_wait && atomic_read(&qp->state) == RS_LINK_UP && qp->cm_id) {
+	if (!READ_ONCE(qp->key_wait) && atomic_read(&qp->state) == RS_LINK_UP &&
+	    qp->cm_id) {
 		mutex_unlock(&rs_qp_mu);
 		goto out;
 	}
@@ -668,7 +721,7 @@ static void rs_qp_recover(struct work_struct *work)
 fail:
 	if (!READ_ONCE(qp->stop)) {
 		pr_err("cpu %u reconnect to %s gave up\n", qp->cpu, qp->link->server);
-		qp->link->fatal = true;
+		WRITE_ONCE(qp->link->fatal, true);
 	}
 	atomic_set(&qp->state, RS_LINK_OFF);
 	rs_unquiesce(&quiesced);
@@ -849,7 +902,7 @@ static void rs_key_updated(u16 node_id)
 		rcu_read_unlock();
 		return;
 	}
-	link->fatal = false;
+	WRITE_ONCE(link->fatal, false);
 	WRITE_ONCE(link->key_gen, link->key_gen + 1);
 	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
 		struct rs_qp *fault = &link->qps[cpu * 2];
@@ -1153,14 +1206,21 @@ static void __exit roswap_exit(void)
 {
 	rs_genl_unregister();
 	rs_stop_links();
+	/*
+	 * 先拆 QP 再删盘。stop 之后 poll_work 不再轮询 fault QP，
+	 * 在途请求只能靠 teardown 收尾，否则 del_gendisk 会一直等它们。
+	 */
+	rs_cancel_links();
+	if (roswap_disk)
+		blk_mq_quiesce_queue(roswap_disk->queue);
+	rs_teardown_links();
 	if (roswap_disk) {
+		blk_mq_unquiesce_queue(roswap_disk->queue);
 		del_gendisk(roswap_disk);
 		roswap_cleanup_disk(roswap_disk);
 		roswap_disk = NULL;
 		blk_mq_free_tag_set(&roswap_tag_set);
 	}
-	rs_cancel_links();
-	rs_teardown_links();
 	if (rs_pd)
 		ib_dealloc_pd(rs_pd);
 	destroy_workqueue(roswap_wq);

@@ -193,12 +193,18 @@ static int rs_claim(struct rs_map *m, struct rs_node *node, u32 *loc)
 {
 	u32 gid, ext;
 
+	/* 调用方关着中断，整字跳过已满的位图，压住最坏扫描长度。 */
 	for (gid = 0; gid < RS_MAX_CHUNKS; gid++) {
 		struct rs_chunk *c = &m->chunks[gid];
 
 		if (!c->active || c->node_id != node->id || !c->free_ext)
 			continue;
 		for (ext = 0; ext < c->nr_ext; ext++) {
+			if (!(ext % BITS_PER_LONG) &&
+			    c->bm[ext / BITS_PER_LONG] == ~0UL) {
+				ext += BITS_PER_LONG - 1;
+				continue;
+			}
 			if (rs_bit(c->bm, ext))
 				continue;
 			rs_bit_set(c->bm, ext);
@@ -355,11 +361,12 @@ int rs_map_node_add(u16 node_id)
 {
 	struct rs_map *m = rs_map;
 	u32 i, free_slot = RS_MAX_NODES;
+	unsigned long flags;
 	int ret = 0;
 
 	if (!m)
 		return -ENODEV;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	for (i = 0; i < RS_MAX_NODES; i++) {
 		if (m->nodes[i].active && m->nodes[i].id == node_id) {
 			ret = 0;
@@ -378,7 +385,7 @@ int rs_map_node_add(u16 node_id)
 	m->nodes[free_slot].rtt_us = 1;
 	m->nodes[free_slot].free_ext = 0;
 out:
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
 
@@ -397,6 +404,7 @@ int rs_map_chunk_add(u16 node_id, u32 gid, u32 epoch, u64 raddr, u32 rkey,
 	struct rs_chunk *c;
 	struct rs_node *node;
 	unsigned long *bm;
+	unsigned long flags;
 	int ret = 0;
 
 	if (!m)
@@ -406,7 +414,7 @@ int rs_map_chunk_add(u16 node_id, u32 gid, u32 epoch, u64 raddr, u32 rkey,
 	bm = rs_bitmap(chunk_mb);
 	if (!bm)
 		return -ENOMEM;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	node = rs_node(m, node_id);
 	if (!node) {
 		ret = -ENOENT;
@@ -433,7 +441,7 @@ int rs_map_chunk_add(u16 node_id, u32 gid, u32 epoch, u64 raddr, u32 rkey,
 	bm = NULL;
 	node->free_ext += chunk_mb;
 out:
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	kfree(bm);
 	return ret;
 }
@@ -442,13 +450,14 @@ int rs_map_chunk_update(u32 gid, u32 epoch, u64 raddr, u32 rkey)
 {
 	struct rs_map *m = rs_map;
 	struct rs_chunk *c;
+	unsigned long flags;
 	int changed = 0;
 
 	if (!m)
 		return -ENODEV;
 	if (gid >= RS_MAX_CHUNKS)
 		return -EINVAL;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	c = &m->chunks[gid];
 	if (!c->active) {
 		changed = -ENOENT;
@@ -464,7 +473,7 @@ int rs_map_chunk_update(u32 gid, u32 epoch, u64 raddr, u32 rkey)
 		changed = 1;
 	}
 out:
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return changed;
 }
 
@@ -491,16 +500,17 @@ static int rs_activate(struct rs_map *m, u32 slot, struct rs_remote *out)
 int rs_map_prepare_write(u64 off, u32 len, struct rs_remote *out)
 {
 	struct rs_map *m = rs_map;
+	unsigned long flags;
 	u32 slot;
 	int ret;
 
 	if (!m || len != RS_PAGE_SIZE)
 		return -EINVAL;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	ret = rs_slot(m, off, len, &slot);
 	if (!ret)
 		ret = rs_activate(m, slot, out);
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
 
@@ -509,12 +519,13 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_remote *out)
 	struct rs_map *m = rs_map;
 	u32 slot, ext_i;
 	struct rs_extent *ext;
+	unsigned long flags;
 	u8 state;
 	int ret;
 
 	if (!m || len != RS_PAGE_SIZE)
 		return -EINVAL;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	ret = rs_slot(m, off, len, &slot);
 	if (ret)
 		goto out;
@@ -542,19 +553,20 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_remote *out)
 	if (ret)
 		m->sstate[slot] = state;
 out:
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
 
 int rs_map_discard(u64 off, u32 len)
 {
 	struct rs_map *m = rs_map;
+	unsigned long flags;
 	u32 slot, n, i;
 	int ret;
 
 	if (!m)
 		return -EINVAL;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	ret = rs_slot(m, off, len, &slot);
 	if (ret)
 		goto out;
@@ -584,13 +596,14 @@ int rs_map_discard(u64 off, u32 len)
 		}
 	}
 out:
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
 
 void rs_map_finish(u64 off)
 {
 	struct rs_map *m = rs_map;
+	unsigned long flags;
 	u32 slot;
 
 	if (!m || (off & (RS_PAGE_SIZE - 1)))
@@ -598,38 +611,40 @@ void rs_map_finish(u64 off)
 	slot = off >> RS_PAGE_SHIFT;
 	if (slot >= m->nr_slots)
 		return;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	m->sstate[slot] &= (u8)~RS_S_BUSY;
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 }
 
 u32 rs_map_chunk_gen(u32 gid)
 {
 	struct rs_map *m = rs_map;
+	unsigned long flags;
 	u32 gen = 0;
 
 	if (!m || gid >= RS_MAX_CHUNKS)
 		return 0;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	if (m->chunks[gid].active)
 		gen = m->chunks[gid].gen;
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return gen;
 }
 
 int rs_map_chunk_node(u32 gid, u16 *node_id)
 {
 	struct rs_map *m = rs_map;
+	unsigned long flags;
 	int ret = -ENOENT;
 
 	if (!m || gid >= RS_MAX_CHUNKS || !node_id)
 		return -EINVAL;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	if (m->chunks[gid].active) {
 		*node_id = m->chunks[gid].node_id;
 		ret = 0;
 	}
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
 
@@ -637,11 +652,12 @@ void rs_map_stats(struct rs_map_stats *out)
 {
 	struct rs_map *m = rs_map;
 	u32 i, chunks = 0, nodes = 0, free_ext = 0;
+	unsigned long flags;
 
 	memset(out, 0, sizeof(*out));
 	if (!m)
 		return;
-	spin_lock(&m->lock);
+	spin_lock_irqsave(&m->lock, flags);
 	out->nr_slots = m->nr_slots;
 	out->used_slots = m->used_slots;
 	for (i = 0; i < RS_MAX_CHUNKS; i++) {
@@ -657,5 +673,5 @@ void rs_map_stats(struct rs_map_stats *out)
 	out->nr_chunks = chunks;
 	out->nr_nodes = nodes;
 	out->free_extents = free_ext + rs_reserve_held();
-	spin_unlock(&m->lock);
+	spin_unlock_irqrestore(&m->lock, flags);
 }
