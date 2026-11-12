@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 pub mod chunk;
 pub mod config;
+pub mod controller;
+pub mod genl;
+pub mod proto;
 pub mod provider;
 pub mod rdma;
+pub mod register;
 pub mod rpc;
 pub mod sys;

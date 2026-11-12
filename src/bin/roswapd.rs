@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-use log::{error, info, warn};
+use log::{error, info};
 use roswap::config::{Config, Role};
 use roswap::provider::ProviderRuntime;
+use roswap::register;
 use roswap::rpc::serve_provider;
 use roswap::sys;
 use std::env;
@@ -49,6 +50,10 @@ fn init_roswapd_runtime(cfg: &Config) {
                 process::exit(1);
             });
             runtime.log_summary();
+            let controller = cfg.provider.controller_endpoint().unwrap_or_else(|e| {
+                error!("provider config failed: {e}");
+                process::exit(1);
+            });
 
             let stop = Arc::new(AtomicBool::new(false));
             install_stop_signals(&stop);
@@ -58,8 +63,21 @@ fn init_roswapd_runtime(cfg: &Config) {
                 Arc::clone(&stop),
                 Arc::clone(&grpc_failed),
             );
+            let registration = controller.map(|addr| {
+                register::spawn(
+                    addr,
+                    cfg.provider.node_id,
+                    cfg.provider.node_epoch,
+                    cfg.provider.listen_addr.to_string(),
+                    runtime.exported_chunks(),
+                    Arc::clone(&stop),
+                )
+            });
             let run = runtime.run_until_stopped(Arc::clone(&stop));
             stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = registration {
+                let _ = handle.join();
+            }
             let _ = grpc.join();
             if let Err(e) = run {
                 error!("provider runtime error: {e}");
@@ -71,9 +89,12 @@ fn init_roswapd_runtime(cfg: &Config) {
             }
         }
         Role::Controller => {
-            warn!("controller role is a placeholder");
-            error!("unsupported role: {}", cfg.role);
-            process::exit(1);
+            let stop = Arc::new(AtomicBool::new(false));
+            install_stop_signals(&stop);
+            if let Err(e) = roswap::controller::run(&cfg.controller, Arc::clone(&stop)) {
+                error!("controller failed: {e}");
+                process::exit(1);
+            }
         }
     }
 }

@@ -3,6 +3,7 @@
 #   make -C /lib/modules/$(uname -r)/build M=$PWD/kernel modules
 ifneq ($(KERNELRELEASE),)
 obj-m := roswap.o
+roswap-y := core.o map.o genl.o
 
 # 没有 OFED 树就用内核自带的 rdma/ 头。这条路径没有在 MLNX_OFED 上编过。
 OFA_KERNEL := /usr/src/ofa_kernel/default
@@ -22,6 +23,12 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 all:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
+map-test:
+	gcc -std=c11 -Wall -Wextra -Werror -DRS_MAP_TEST -I$(CURDIR) \
+		$(CURDIR)/map_test.c -o /tmp/roswap-map-test
+	/tmp/roswap-map-test
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	rm -f /tmp/roswap-map-test
 endif

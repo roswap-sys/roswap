@@ -7,8 +7,63 @@ service ProviderService {
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
 }
 
+service ClusterService {
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc ReportChunks(ReportChunksRequest) returns (ReportChunksResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetCluster(GetClusterRequest) returns (GetClusterResponse);
+}
+
 message GetInfoRequest {}
 
 message GetInfoResponse {
   string version = 1;
+}
+
+message ChunkDesc {
+  uint32 gid = 1;
+  uint32 epoch = 2;
+  uint64 raddr = 3;
+  uint32 rkey = 4;
+  uint32 size_mb = 5;
+}
+
+message JoinRequest {
+  uint32 node_id = 1;
+  uint32 node_epoch = 2;
+  string listen_addr = 3;
+}
+
+message JoinResponse {}
+
+message ReportChunksRequest {
+  uint32 node_id = 1;
+  uint32 node_epoch = 2;
+  string listen_addr = 3;
+  repeated ChunkDesc chunks = 4;
+}
+
+message ReportChunksResponse {}
+
+message HeartbeatRequest {
+  uint32 node_id = 1;
+  uint32 node_epoch = 2;
+  string listen_addr = 3;
+  repeated ChunkDesc chunks = 4;
+}
+
+message HeartbeatResponse {}
+
+message GetClusterRequest {}
+
+message NodeView {
+  uint32 node_id = 1;
+  uint32 node_epoch = 2;
+  string listen_addr = 3;
+  repeated ChunkDesc chunks = 4;
+  bool kernel_synced = 5;
+}
+
+message GetClusterResponse {
+  repeated NodeView nodes = 1;
 }

@@ -3,13 +3,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use crate::proto::provider_service_server::{ProviderService, ProviderServiceServer};
+use crate::proto::{GetInfoRequest, GetInfoResponse};
 use tonic::{Request, Response, Status};
-tonic::include_proto!("roswap");
 
 pub struct Info;
 
 #[tonic::async_trait]
-impl provider_service_server::ProviderService for Info {
+impl ProviderService for Info {
     async fn get_info(
         &self,
         _request: Request<GetInfoRequest>,
@@ -25,7 +26,7 @@ pub async fn serve_provider(
     stop: Arc<AtomicBool>,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
-        .add_service(provider_service_server::ProviderServiceServer::new(Info))
+        .add_service(ProviderServiceServer::new(Info))
         .serve_with_shutdown(addr, wait_stop(stop))
         .await
 }
@@ -38,9 +39,10 @@ async fn wait_stop(stop: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_service_client::ProviderServiceClient;
-    use super::provider_service_server::ProviderServiceServer;
-    use super::{serve_provider, GetInfoRequest, Info};
+    use super::{serve_provider, Info};
+    use crate::proto::provider_service_client::ProviderServiceClient;
+    use crate::proto::provider_service_server::ProviderServiceServer;
+    use crate::proto::GetInfoRequest;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;

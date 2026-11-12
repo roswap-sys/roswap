@@ -28,6 +28,8 @@ static inline struct gendisk *roswap_alloc_disk(struct blk_mq_tag_set *set)
 		.max_hw_sectors = PAGE_SIZE >> SECTOR_SHIFT,
 		.max_segments = 1,
 		.dma_alignment = PAGE_SIZE - 1,
+		.max_discard_sectors = (1U << 20) >> SECTOR_SHIFT,
+		.discard_granularity = 1U << 20,
 	};
 
 	return blk_mq_alloc_disk(set, &lim, NULL);
@@ -52,6 +54,11 @@ static inline void roswap_apply_queue_limits(struct gendisk *disk)
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->queue);
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
+	blk_queue_flag_set(QUEUE_FLAG_DISCARD, disk->queue);
+	disk->queue->limits.discard_granularity = 1U << 20;
+	blk_queue_max_discard_sectors(disk->queue, (1U << 20) >> SECTOR_SHIFT);
 #endif
 }
 

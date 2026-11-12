@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -28,6 +29,22 @@ pub struct Config {
     pub role: Role,
     #[serde(default)]
     pub provider: ProviderConfig,
+    #[serde(default)]
+    pub controller: ControllerConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerConfig {
+    pub listen_addr: SocketAddr,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 12221)),
+        }
+    }
 }
 
 impl Config {
@@ -104,6 +121,55 @@ mod tests {
     #[test]
     fn unknown_field_is_rejected() {
         let err = toml::from_str::<Config>("role = \"provider\"\nextra = 1\n").unwrap_err();
+        assert!(err.to_string().contains("extra"));
+    }
+
+    #[test]
+    fn provider_registration_fields_default_and_parse() {
+        let cfg: Config = toml::from_str("role = \"provider\"\n").unwrap();
+        assert_eq!(cfg.provider.node_id, 1);
+        assert_eq!(cfg.provider.controller_addr, "");
+        assert_eq!(cfg.provider.controller_endpoint().unwrap(), None);
+        assert_eq!(cfg.controller, ControllerConfig::default());
+        assert_eq!(
+            cfg.controller.listen_addr,
+            "0.0.0.0:12221".parse::<SocketAddr>().unwrap()
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+            role = "provider"
+            [provider]
+            node_id = 6
+            controller_addr = "10.0.0.1:12221"
+            [controller]
+            listen_addr = "127.0.0.1:9"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider.node_id, 6);
+        assert_eq!(
+            cfg.provider.controller_endpoint().unwrap(),
+            Some("10.0.0.1:12221".parse().unwrap())
+        );
+        assert_eq!(
+            cfg.controller.listen_addr,
+            "127.0.0.1:9".parse::<SocketAddr>().unwrap()
+        );
+        let mut bad = cfg.provider.clone();
+        bad.controller_addr = "not-an-address".to_string();
+        assert!(bad.controller_endpoint().unwrap_err().to_string().contains("controller_addr"));
+    }
+
+    #[test]
+    fn controller_role_rejects_unknown_listen_fields() {
+        let cfg: Config = toml::from_str("role = \"controller\"\n").unwrap();
+        assert_eq!(cfg.role, Role::Controller);
+        assert_eq!(cfg.provider, ProviderConfig::default());
+        let err = toml::from_str::<Config>(
+            "role = \"controller\"\n[controller]\nextra = 1\n",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("extra"));
     }
 }

@@ -39,6 +39,16 @@ pub struct ProviderConfig {
     pub chunk_size_mb: usize,
     pub num_chunks: usize,
     pub node_epoch: u32,
+    /// 向 controller 注册时用的节点号。0 留给 insmod 手工带起来的那条链路。
+    #[serde(default = "default_node_id")]
+    pub node_id: u16,
+    /// 空字符串表示不向 controller 注册。
+    #[serde(default)]
+    pub controller_addr: String,
+}
+
+fn default_node_id() -> u16 {
+    1
 }
 
 impl Default for ProviderConfig {
@@ -51,8 +61,33 @@ impl Default for ProviderConfig {
             chunk_size_mb: 64,
             num_chunks: 1,
             node_epoch: 1,
+            node_id: default_node_id(),
+            controller_addr: String::new(),
         }
     }
+}
+
+impl ProviderConfig {
+    pub fn controller_endpoint(&self) -> io::Result<Option<SocketAddr>> {
+        if self.controller_addr.is_empty() {
+            return Ok(None);
+        }
+        self.controller_addr.parse().map(Some).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("controller_addr: {err}"),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkExport {
+    pub gid: u32,
+    pub epoch: u32,
+    pub raddr: u64,
+    pub rkey: u32,
+    pub size_mb: u32,
 }
 
 pub struct ProviderRuntime {
@@ -198,6 +233,19 @@ impl ProviderRuntime {
 
     pub fn active_connection_count(&self) -> usize {
         self.conns.len()
+    }
+
+    pub fn exported_chunks(&self) -> Vec<ChunkExport> {
+        self.chunks
+            .iter()
+            .map(|chunk| ChunkExport {
+                gid: chunk.gid,
+                epoch: chunk.epoch,
+                raddr: chunk.addr(),
+                rkey: chunk.rkey(),
+                size_mb: (chunk.len() >> 20) as u32,
+            })
+            .collect()
     }
 
     pub fn poll_and_handle_once(&mut self, timeout_ms: i32) -> io::Result<bool> {
@@ -596,11 +644,20 @@ mod tests {
             chunk_size_mb: 4,
             num_chunks: 1,
             node_epoch: 3,
+            node_id: 1,
+            controller_addr: String::new(),
         };
 
         let mut provider = ProviderRuntime::init(&cfg).expect("init provider");
         let remote_chunk_addr = provider.chunks[0].addr();
         let remote_chunk_rkey = provider.chunks[0].rkey();
+        let exported = provider.exported_chunks();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].gid, 0);
+        assert_eq!(exported[0].epoch, 3);
+        assert_eq!(exported[0].raddr, remote_chunk_addr);
+        assert_eq!(exported[0].rkey, remote_chunk_rkey);
+        assert_eq!(exported[0].size_mb, 4);
         let remote_hb_addr = provider.heartbeat.addr();
         let remote_hb_rkey = provider.heartbeat.rkey();
 
