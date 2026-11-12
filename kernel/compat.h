@@ -55,8 +55,11 @@ static inline void roswap_apply_queue_limits(struct gendisk *disk)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->queue);
 #endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+	/* 6.0 删掉了这个 flag，非零的 max_discard_sectors 就表示支持 discard。 */
 	blk_queue_flag_set(QUEUE_FLAG_DISCARD, disk->queue);
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
 	disk->queue->limits.discard_granularity = 1U << 20;
 	blk_queue_max_discard_sectors(disk->queue, (1U << 20) >> SECTOR_SHIFT);
 #endif
