@@ -19,8 +19,7 @@ jobs:
 
     - name: Install RDMA libraries
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        bash .github/scripts/apt-install.sh \
           libibverbs-dev \
           librdmacm-dev \
           rdma-core \
