@@ -78,9 +78,24 @@ jobs:
     - name: Soft-RoCE datapath
       run: |
         set -euo pipefail
-        sudo modprobe rdma_rxe || sudo modprobe siw
+        # 22.04 azure 内核把 rdma_rxe / siw 放在 linux-modules-extra，镜像里默认没装。
+        load_soft_rdma() {
+          sudo modprobe rdma_rxe && return 0
+          sudo modprobe siw && return 0
+          return 1
+        }
+        if ! load_soft_rdma; then
+          bash .github/scripts/apt-install.sh "linux-modules-extra-$(uname -r)"
+          load_soft_rdma
+        fi
         sudo modprobe rdma_ucm || true
-        NETDEV=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+        NETDEV=$(ip -o -4 route show to default | awk '{print $5; exit}')
+        if [ -z "${NETDEV}" ]; then
+          echo "no default ipv4 route" >&2
+          ip -o -4 route show >&2 || true
+          exit 1
+        fi
+        echo "Binding RDMA device to netdev: ${NETDEV}"
         sudo rdma link add rxe0 type rxe netdev "$NETDEV" || sudo rdma link add siw0 type siw netdev "$NETDEV"
         rdma link show
         cargo build --release --bin roswapd
