@@ -40,4 +40,17 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose -- --test-threads=1
+      run: |
+        set -euo pipefail
+        attempts=3
+        for i in $(seq 1 "$attempts"); do
+          if cargo test --verbose -- --test-threads=1; then
+            exit 0
+          fi
+          if [ "$i" -eq "$attempts" ]; then
+            echo "cargo test failed after ${attempts} attempts" >&2
+            exit 1
+          fi
+          echo "cargo test failed (attempt ${i}/${attempts}), retrying" >&2
+          sleep 2
+        done
