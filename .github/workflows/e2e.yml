@@ -58,6 +58,9 @@ jobs:
 
     - name: Setup Soft-RoCE
       run: |
+        if ! modinfo rdma_rxe >/dev/null 2>&1; then
+          bash .github/scripts/apt-install.sh "linux-modules-extra-$(uname -r)"
+        fi
         sudo modprobe rdma_rxe
         sudo ip link add roswap0 type veth peer name roswap1
         sudo ip link set roswap0 up
