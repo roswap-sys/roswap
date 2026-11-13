@@ -1,0 +1,16 @@
+# run.sh 会把 @RDMA_DEV@ 和 @RDMA_IP@ 替换掉再交给 roswapd。
+# listen_addr 必须是这块 RDMA 设备上的地址：内核按这里拨号，
+# 而注册上报用的是配置里的地址，不是实际 bind 出来的地址。
+# 端口不用 18515/12220/12221，避免和正在运行的 roswapd 撞车。
+role = "provider"
+
+[provider]
+device_name = "@RDMA_DEV@"
+listen_addr = "@RDMA_IP@:18615"
+grpc_addr = "127.0.0.1:12320"
+mem_dir = "/dev/shm/roswap-e2e"
+chunk_size_mb = 64
+num_chunks = 2
+node_epoch = 1
+node_id = 1
+controller_addr = "127.0.0.1:12321"

@@ -1,0 +1,106 @@
+name: e2e
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - 'src/**'
+      - 'kernel/**'
+      - 'tools/**'
+      - 'proto/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e.yml'
+      - '.github/scripts/apt-install.sh'
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - 'src/**'
+      - 'kernel/**'
+      - 'tools/**'
+      - 'proto/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e.yml'
+      - '.github/scripts/apt-install.sh'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        bash .github/scripts/apt-install.sh \
+          build-essential \
+          linux-headers-$(uname -r) \
+          libibverbs-dev \
+          librdmacm-dev \
+          protobuf-compiler
+
+    - name: Build
+      run: |
+        make -C kernel
+        cargo build --release --bins
+        gcc -O2 -Wall -Wextra -o tools/blkcheck tools/blkcheck.c
+        gcc -O2 -Wall -Wextra -o tools/memhold tools/memhold.c
+
+    - name: Setup Soft-RoCE
+      run: |
+        sudo modprobe rdma_rxe
+        sudo ip link add roswap0 type veth peer name roswap1
+        sudo ip link set roswap0 up
+        sudo ip link set roswap1 up
+        sudo ip addr add 192.168.88.1/24 dev roswap0
+        sudo rdma link add rxe0 type rxe netdev roswap0
+
+    - name: Block device
+      run: sudo tests/e2e/run.sh blk
+
+    - name: Swap
+      run: sudo tests/e2e/run.sh swap
+
+    - name: Fault injection
+      run: sudo tests/e2e/run.sh fault
+
+    - name: Collect logs
+      if: always()
+      run: |
+        mkdir -p e2e-logs
+        sudo dmesg > e2e-logs/dmesg.txt || true
+        if [ -d /tmp/roswap-e2e ]; then
+          sudo cp -a /tmp/roswap-e2e/. e2e-logs/
+        fi
+        sudo target/release/roswapctl status > e2e-logs/status.txt 2>&1 || true
+        sudo target/release/roswapctl cluster 127.0.0.1:12321 > e2e-logs/cluster.txt 2>&1 || true
+        sudo chown -R "$(id -u):$(id -g)" e2e-logs
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-logs
+        path: e2e-logs
+        if-no-files-found: ignore
+
+    - name: Cleanup
+      if: always()
+      run: |
+        sudo swapoff /dev/roswap0 || true
+        sudo rmmod roswap || true
+        if [ -d /tmp/roswap-e2e ]; then
+          sudo kill $(cat /tmp/roswap-e2e/*.pid 2>/dev/null) || true
+        fi
+        sudo rdma link delete rxe0 || true
+        sudo ip link del roswap0 || true

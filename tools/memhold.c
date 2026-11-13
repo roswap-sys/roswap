@@ -27,6 +27,7 @@ static int interactive;
 static int use_color;
 static int watch;
 static int interval_ms = 2000;
+static int batch_rounds;
 static int have_last;
 static unsigned long last_rss_kb;
 static unsigned long last_swap_kb;
@@ -49,15 +50,16 @@ static void prompt(void)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"用法: %s [-m 大小] [-i 秒]\n"
+		"用法: %s [-m 大小] [-i 秒] [-n 轮数]\n"
 		"\n"
 		"持续占用一块匿名内存。每一页写入该页偏移，并定期读回校验。\n"
 		"申请量大于 MemoryMax 时，读页会把数据从 swap 换入。\n"
 		"\n"
 		"  -m    起始大小，默认 40 MiB。例如 40、512k、1g\n"
 		"  -i    检查间隔，默认 2 秒。0 表示只在输入命令时检查\n"
+		"  -n    校验这么多轮后退出。全部通过返回 0，有一页对不上返回 1\n"
 		"\n"
-		"运行后输入 help 查看命令。\n",
+		"不带 -n 时一直运行。运行后输入 help 查看命令。\n",
 		prog);
 }
 
@@ -581,7 +583,7 @@ int main(int argc, char **argv)
 	interactive = isatty(STDIN_FILENO);
 	use_color = isatty(STDOUT_FILENO);
 
-	while ((opt = getopt(argc, argv, "m:i:h")) != -1) {
+	while ((opt = getopt(argc, argv, "m:i:n:h")) != -1) {
 		char *end;
 
 		switch (opt) {
@@ -599,13 +601,21 @@ int main(int argc, char **argv)
 				return 2;
 			}
 			break;
+		case 'n':
+			errno = 0;
+			batch_rounds = (int)strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end != '\0' || batch_rounds < 1) {
+				usage(argv[0]);
+				return 2;
+			}
+			break;
 		default:
 			usage(argv[0]);
 			return 2;
 		}
 	}
 
-	if (interactive) {
+	if (interactive && !batch_rounds) {
 		puts("memhold：持续占用内存，按页写入偏移并校验。");
 		puts("输入 help 查看命令，直接回车查看状态。");
 		putchar('\n');
@@ -613,6 +623,26 @@ int main(int argc, char **argv)
 
 	if (apply_size(initial, 0) < 0)
 		return 1;
+
+	if (batch_rounds > 0) {
+		int i, failed = 0;
+
+		for (i = 0; i < batch_rounds; i++) {
+			size_t bad = 0;
+			int ok;
+
+			if (i > 0 && interval_ms > 0)
+				(void)poll(NULL, 0, interval_ms);
+			ok = verify(&bad);
+			print_status(ok, bad);
+			if (!ok) {
+				failed = 1;
+				break;
+			}
+		}
+		resize(0);
+		return failed ? 1 : 0;
+	}
 
 	for (;;) {
 		size_t bad = 0;

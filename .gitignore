@@ -12,6 +12,8 @@ modules.order
 
 *.out
 /target
+tools/blkcheck
+tools/memhold
 
 build/
 CMakeCache.txt
