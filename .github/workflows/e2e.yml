@@ -124,12 +124,15 @@ jobs:
         # 最老的 LTS、Debian 12 用的 6.1、最新 LTS，再加最新 stable 提前发现新内核的问题。
         kernel: [ "5.10", "6.1", "6.18", "stable" ]
         include:
+          # 5.15 之前的内核不能直接把 virtiofs 挂成根，要先进 initramfs 再切换。
           - kernel: "5.10"
             cc: "gcc-11"
+            vng_args: "--force-initramfs"
           - kernel: "stable"
             experimental: true
     env:
       CC: ${{ matrix.cc || 'gcc' }}
+      VNG_ARGS: ${{ matrix.vng_args }}
 
     steps:
     - uses: actions/checkout@v4
@@ -203,7 +206,8 @@ jobs:
         mkdir -p "$out"
         cd "$KDIR"
         set +e
-        vng --verbose --disable-microvm --user root --cpus 2 --memory 3G \
+        # shellcheck disable=SC2086
+        vng --verbose --disable-microvm $VNG_ARGS --user root --cpus 2 --memory 3G \
           --rwdir "$GITHUB_WORKSPACE" \
           --exec "$GITHUB_WORKSPACE/tests/e2e/vm-run.sh $out" 2>&1 | tee "$out/console.txt"
         vng_rc=${PIPESTATUS[0]}
