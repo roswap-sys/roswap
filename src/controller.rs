@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 
 use crate::config::ControllerConfig;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkReport {
     pub gid: u32,
     pub epoch: u32,
@@ -26,7 +26,10 @@ pub struct ChunkReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelOp {
-    NodeAdd { node_id: u16, addr: String },
+    NodeAdd {
+        node_id: u16,
+        addr: String,
+    },
     ChunkAdd {
         node_id: u16,
         gid: u32,
@@ -47,18 +50,6 @@ pub enum KernelOp {
 struct ChunkState {
     desired: ChunkReport,
     kernel: Option<ChunkReport>,
-}
-
-impl Default for ChunkReport {
-    fn default() -> Self {
-        Self {
-            gid: 0,
-            epoch: 0,
-            raddr: 0,
-            rkey: 0,
-            size_mb: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -140,7 +131,10 @@ impl Registry {
                 rkey,
                 size_mb,
             } => {
-                if let Some(state) = self.nodes.get_mut(node_id).and_then(|node| node.chunks.get_mut(gid))
+                if let Some(state) = self
+                    .nodes
+                    .get_mut(node_id)
+                    .and_then(|node| node.chunks.get_mut(gid))
                 {
                     state.kernel = Some(ChunkReport {
                         gid: *gid,
@@ -190,7 +184,10 @@ impl Registry {
                     .collect();
                 let kernel_synced = node.kernel_listen.as_deref() == Some(node.listen.as_str())
                     && !node.listen.is_empty()
-                    && node.chunks.values().all(|state| state.kernel.as_ref() == Some(&state.desired));
+                    && node
+                        .chunks
+                        .values()
+                        .all(|state| state.kernel.as_ref() == Some(&state.desired));
                 NodeView {
                     node_id: u32::from(*id),
                     node_epoch: node.epoch,
@@ -220,7 +217,13 @@ impl Controller {
         self.registry.upsert(node_id, epoch, listen, &[]);
     }
 
-    pub fn report(&mut self, node_id: u16, epoch: u32, listen: &str, chunks: &[ChunkReport]) -> io::Result<()> {
+    pub fn report(
+        &mut self,
+        node_id: u16,
+        epoch: u32,
+        listen: &str,
+        chunks: &[ChunkReport],
+    ) -> io::Result<()> {
         self.registry.upsert(node_id, epoch, listen, chunks);
         self.sync_kernel()
     }
@@ -284,7 +287,8 @@ fn chunks_from(descs: &[ChunkDesc]) -> Vec<ChunkReport> {
 impl ClusterService for Svc {
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
         let req = request.into_inner();
-        let node_id = u16::try_from(req.node_id).map_err(|_| Status::invalid_argument("node_id"))?;
+        let node_id =
+            u16::try_from(req.node_id).map_err(|_| Status::invalid_argument("node_id"))?;
         self.controller
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -356,7 +360,7 @@ pub fn run(cfg: &ControllerConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
             .serve_with_shutdown(cfg.listen_addr, wait_stop(stop))
             .await
     })
-    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    .map_err(io::Error::other)
 }
 
 async fn wait_stop(stop: Arc<AtomicBool>) {

@@ -133,6 +133,10 @@ pub struct CmEventView {
 }
 
 /// `rdma_ack_cm_event` 会释放事件和它的 private_data。必须在 ack 之前把要用的字节拷出来。
+///
+/// # Safety
+///
+/// `raw` 必须指向 `rdma_get_cm_event` 返回、尚未 ack 的事件。
 pub unsafe fn snapshot_cm_event(raw: *const sys::rdma_cm_event) -> CmEventView {
     let ev = &*raw;
     CmEventView {

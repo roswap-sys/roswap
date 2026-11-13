@@ -360,6 +360,9 @@ pub struct rdma_cm_event {
     pub conn: rdma_conn_param,
 }
 
+/// # Safety
+///
+/// `qp` 必须是有效的 QP，`wr` 链表和 `bad_wr` 在调用期间可访问。
 #[inline]
 pub unsafe fn ibv_post_send(
     qp: *mut ibv_qp,
@@ -372,6 +375,9 @@ pub unsafe fn ibv_post_send(
     }
 }
 
+/// # Safety
+///
+/// `cq` 必须是有效的 CQ，`wc` 至少能容纳 `num_entries` 个元素。
 #[inline]
 pub unsafe fn ibv_poll_cq(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) -> c_int {
     match (*(*cq).context).ops.poll_cq {

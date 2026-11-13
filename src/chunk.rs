@@ -30,7 +30,7 @@ impl Chunk {
         epoch: u32,
         len: usize,
     ) -> io::Result<Self> {
-        if len == 0 || len % (1 << 20) != 0 {
+        if len == 0 || !len.is_multiple_of(1 << 20) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "chunk size must be a positive multiple of 1 MiB",
@@ -111,6 +111,7 @@ impl Chunk {
         self.addr.as_ptr() as u64
     }
 
+    #[allow(clippy::len_without_is_empty)] // create 拒绝 0 长度，chunk 不会为空
     pub fn len(&self) -> usize {
         self.len
     }

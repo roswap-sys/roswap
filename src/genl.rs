@@ -153,7 +153,12 @@ impl GenlClient {
         }
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
-        let mut msg = Msg::new(GENL_ID_CTRL, NLM_F_REQUEST | NLM_F_ACK, seq, CTRL_CMD_GETFAMILY);
+        let mut msg = Msg::new(
+            GENL_ID_CTRL,
+            NLM_F_REQUEST | NLM_F_ACK,
+            seq,
+            CTRL_CMD_GETFAMILY,
+        );
         msg.put_str(CTRL_ATTR_FAMILY_NAME, "roswap");
         msg.finish();
         let payload = self.talk(GENL_ID_CTRL, seq, &msg.buf)?;
@@ -343,8 +348,13 @@ mod tests {
         &msg.buf[NLMSG_HDRLEN + GENL_HDRLEN..]
     }
 
-    fn attr<'a>(attrs: &'a [(u16, Vec<u8>)], id: u16) -> &'a [u8] {
-        attrs.iter().find(|(attr, _)| *attr == id).unwrap().1.as_slice()
+    fn attr(attrs: &[(u16, Vec<u8>)], id: u16) -> &[u8] {
+        attrs
+            .iter()
+            .find(|(attr, _)| *attr == id)
+            .unwrap()
+            .1
+            .as_slice()
     }
 
     fn nl_error(seq: u32, code: i32) -> Vec<u8> {
@@ -391,7 +401,10 @@ mod tests {
             msg.buf.len() as u32
         );
         assert_eq!(u16::from_ne_bytes(msg.buf[4..6].try_into().unwrap()), 22);
-        assert_eq!(u16::from_ne_bytes(msg.buf[6..8].try_into().unwrap()), NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(
+            u16::from_ne_bytes(msg.buf[6..8].try_into().unwrap()),
+            NLM_F_REQUEST | NLM_F_ACK
+        );
         assert_eq!(u32::from_ne_bytes(msg.buf[8..12].try_into().unwrap()), 7);
         assert_eq!(msg.buf[16], RS_CMD_NODE_ADD);
         assert_eq!(msg.buf[17], 1);
@@ -441,7 +454,12 @@ mod tests {
 
     #[test]
     fn family_lookup_names_roswap() {
-        let mut msg = Msg::new(GENL_ID_CTRL, NLM_F_REQUEST | NLM_F_ACK, 1, CTRL_CMD_GETFAMILY);
+        let mut msg = Msg::new(
+            GENL_ID_CTRL,
+            NLM_F_REQUEST | NLM_F_ACK,
+            1,
+            CTRL_CMD_GETFAMILY,
+        );
         msg.put_str(CTRL_ATTR_FAMILY_NAME, "roswap");
         msg.finish();
         let attrs = parse_attrs(payload(&msg));

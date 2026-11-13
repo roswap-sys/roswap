@@ -75,7 +75,7 @@ fn cluster_status(addr: &str) -> io::Result<()> {
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
-    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+    .map_err(|err| io::Error::other(err.to_string()))
 }
 
 fn normalize_http(addr: &str) -> String {
@@ -92,8 +92,14 @@ mod tests {
 
     #[test]
     fn cluster_address_keeps_a_scheme_and_adds_http() {
-        assert_eq!(normalize_http("http://127.0.0.1:12221"), "http://127.0.0.1:12221");
-        assert_eq!(normalize_http("https://controller:12221"), "https://controller:12221");
+        assert_eq!(
+            normalize_http("http://127.0.0.1:12221"),
+            "http://127.0.0.1:12221"
+        );
+        assert_eq!(
+            normalize_http("https://controller:12221"),
+            "https://controller:12221"
+        );
         assert_eq!(normalize_http("127.0.0.1:12221"), "http://127.0.0.1:12221");
         assert_eq!(normalize_http("[::1]:12221"), "http://[::1]:12221");
     }

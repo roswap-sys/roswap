@@ -158,7 +158,11 @@ mod tests {
         );
         let mut bad = cfg.provider.clone();
         bad.controller_addr = "not-an-address".to_string();
-        assert!(bad.controller_endpoint().unwrap_err().to_string().contains("controller_addr"));
+        assert!(bad
+            .controller_endpoint()
+            .unwrap_err()
+            .to_string()
+            .contains("controller_addr"));
     }
 
     #[test]
@@ -166,10 +170,8 @@ mod tests {
         let cfg: Config = toml::from_str("role = \"controller\"\n").unwrap();
         assert_eq!(cfg.role, Role::Controller);
         assert_eq!(cfg.provider, ProviderConfig::default());
-        let err = toml::from_str::<Config>(
-            "role = \"controller\"\n[controller]\nextra = 1\n",
-        )
-        .unwrap_err();
+        let err = toml::from_str::<Config>("role = \"controller\"\n[controller]\nextra = 1\n")
+            .unwrap_err();
         assert!(err.to_string().contains("extra"));
     }
 }

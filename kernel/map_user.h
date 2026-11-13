@@ -21,6 +21,7 @@ typedef struct { int unused; } spinlock_t;
 #define spin_unlock_irqrestore(l, f)	((void)(l), (void)(f))
 #define GFP_KERNEL		0
 #define kvzalloc(sz, gfp)	calloc(1, (sz))
+#define kvcalloc(n, sz, gfp)	calloc((n), (sz))
 #define kvfree(p)		free(p)
 #define kzalloc(sz, gfp)	calloc(1, (sz))
 #define kfree(p)		free(p)

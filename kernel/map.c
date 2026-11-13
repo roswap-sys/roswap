@@ -467,7 +467,7 @@ int rs_map_init(u32 capacity_mb)
 	m->nr_extents = capacity_mb;
 	m->nr_slots = capacity_mb << (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
 	m->sstate = kvzalloc(m->nr_slots, GFP_KERNEL);
-	m->extents = kvzalloc(sizeof(*m->extents) * m->nr_extents, GFP_KERNEL);
+	m->extents = kvcalloc(m->nr_extents, sizeof(*m->extents), GFP_KERNEL);
 	if (!m->sstate || !m->extents) {
 		kvfree(m->sstate);
 		kvfree(m->extents);
