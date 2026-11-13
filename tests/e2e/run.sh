@@ -40,8 +40,11 @@ scenario_swap() {
 	local child sampler max rc=0
 	bring_up
 	say "mkswap / swapon"
+	# runner 上通常已经有一块优先级更高的 swap。不指定优先级时，
+	# 新设备会排到它后面，页不会落到 /dev/roswap0。
+	swapoff -a || true
 	mkswap /dev/roswap0 >/dev/null
-	swapon /dev/roswap0
+	swapon -p 100 /dev/roswap0
 	say "cgroup 内换页并校验"
 	systemd-run --scope \
 		-p MemoryMax=64M -p MemorySwapMax=128M \
@@ -53,7 +56,11 @@ scenario_swap() {
 	wait "$sampler" || true
 	max=$(cat "$E2E_LOG_DIR/swap.peak")
 	[[ $rc -eq 0 ]] || die "memhold 校验失败，退出码 $rc"
-	[[ ${max:-0} -gt 0 ]] || die "/dev/roswap0 没有被换出使用（Used 峰值 ${max:-0} KiB）"
+	if [[ ${max:-0} -le 0 ]]; then
+		echo "----- /proc/swaps -----" >&2
+		cat /proc/swaps >&2 || true
+		die "/dev/roswap0 没有被换出使用（Used 峰值 ${max:-0} KiB）"
+	fi
 	say "swap 通过，峰值 ${max} KiB"
 }
 
