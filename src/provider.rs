@@ -476,7 +476,7 @@ fn read_boot_id_lo() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rdma::{local_rdma_ipv4, QpPurpose};
+    use crate::rdma::QpPurpose;
     use std::ffi::c_void;
     use std::net::Ipv4Addr;
     use std::os::unix::fs::MetadataExt;
@@ -629,9 +629,7 @@ mod tests {
 
     #[test]
     fn test_provider_one_sided_rdma_write_and_read_loopback() {
-        let target_ip = local_rdma_ipv4().expect("find RDMA interface IPv4");
         let listen_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18599);
-        let connect_addr = SocketAddrV4::new(target_ip, 18599);
         let grpc_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 12220));
         let test_dir = test_dir("roswap-test-rdma");
         let _ = fs::remove_dir_all(&test_dir);
@@ -649,6 +647,7 @@ mod tests {
         };
 
         let mut provider = ProviderRuntime::init(&cfg).expect("init provider");
+        let connect_addr = provider.config.listen_addr;
         let remote_chunk_addr = provider.chunks[0].addr();
         let remote_chunk_rkey = provider.chunks[0].rkey();
         let exported = provider.exported_chunks();

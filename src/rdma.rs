@@ -372,19 +372,6 @@ fn ipv4_from_gid(text: &str) -> Option<Ipv4Addr> {
     }
 }
 
-pub fn local_rdma_ipv4() -> Option<Ipv4Addr> {
-    if let Ok(entries) = std::fs::read_dir("/sys/class/infiniband") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(ip) = rdma_dev_ipv4(name) {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

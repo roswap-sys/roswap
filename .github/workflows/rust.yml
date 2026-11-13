@@ -21,9 +21,6 @@ jobs:
         bash .github/scripts/apt-install.sh \
           libibverbs-dev \
           librdmacm-dev \
-          rdma-core \
-          ibverbs-providers \
-          iproute2 \
           protobuf-compiler
 
     - name: Setup Soft-RoCE
