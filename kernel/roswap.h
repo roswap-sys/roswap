@@ -20,6 +20,8 @@
 /* 设计里的 dead_after_s。到点还没连上就结束等待中的 I/O，避免回收路径一直堵着。 */
 #define ROSWAP_RECOVER_LIMIT_MS	10000
 #define ROSWAP_FAULT_POLL_US	20
+/* 4.096us * 2^14 ≈ 67ms。retry_count 4 时在途请求大约 335ms 报错。 */
+#define ROSWAP_ACK_TIMEOUT	14
 
 enum rs_link_state {
 	RS_LINK_OFF = 0,

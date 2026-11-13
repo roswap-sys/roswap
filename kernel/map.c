@@ -53,16 +53,52 @@ struct rs_reserve {
 	u8 n;
 };
 
+/* 这一位只在 map.c 里用：该页已经算进 degraded_slots。 */
+#define RS_S_SHORT		0x80
+
 struct rs_map {
 	u32 nr_slots;
 	u32 nr_extents;
 	u32 used_slots;
+	u32 degraded_slots;
+	u8 prot;
 	u8 *sstate;
 	struct rs_extent *extents;
 	struct rs_chunk chunks[RS_MAX_CHUNKS];
 	struct rs_node nodes[RS_MAX_NODES];
 	spinlock_t lock;
 };
+
+/*
+ * 副本完成状态字。bit0、bit1 是已到达，bit4、bit5 是成功。
+ * 输入旧字和这一份的结果，输出新字。重复到达时原样返回。
+ * 不修改调用方以外的任何状态。
+ */
+u32 rs_copy_note(u32 word, u32 which, bool success)
+{
+	u32 arrived;
+
+	if (which >= RS_NR_COPIES)
+		return word;
+	arrived = 1u << which;
+	if (word & arrived)
+		return word;
+	word |= arrived;
+	if (success)
+		word |= arrived << 4;
+	return word;
+}
+
+bool rs_copy_settled(u32 word, u8 sent_mask)
+{
+	sent_mask &= (u8)((1u << RS_NR_COPIES) - 1);
+	return ((u8)word & sent_mask) == sent_mask;
+}
+
+u8 rs_copy_ok(u32 word)
+{
+	return (u8)((word >> 4) & ((1u << RS_NR_COPIES) - 1));
+}
 
 static struct rs_map *rs_map;
 
@@ -243,6 +279,62 @@ static int rs_pop_loc(struct rs_map *m, u32 *loc)
 	return 0;
 }
 
+static u16 rs_loc_node(struct rs_map *m, u32 loc)
+{
+	u32 gid = loc >> RS_EXT_IDX_BITS;
+
+	if (gid >= RS_MAX_CHUNKS || !m->chunks[gid].active)
+		return (u16)RS_MAX_NODES;
+	return m->chunks[gid].node_id;
+}
+
+static int rs_claim_other(struct rs_map *m, u16 exclude, u32 *loc)
+{
+	struct rs_node *cands[RS_MAX_NODES];
+	struct rs_node *pick;
+	u32 n = 0;
+	u32 i, a, b;
+
+	for (i = 0; i < RS_MAX_NODES; i++) {
+		if (!m->nodes[i].active || !m->nodes[i].free_ext)
+			continue;
+		if (m->nodes[i].id == exclude)
+			continue;
+		cands[n++] = &m->nodes[i];
+	}
+	if (!n)
+		return -ENOSPC;
+	pick = cands[0];
+	if (n > 1) {
+		a = rs_random() % n;
+		b = rs_random() % n;
+		if (rs_score(cands[b]) > rs_score(cands[a]))
+			pick = cands[b];
+		else
+			pick = cands[a];
+	}
+	return rs_claim(m, pick, loc);
+}
+
+/*
+ * loc0 可能已经把另一台机器的 extent 放进本 CPU 预留。
+ * 第二份先从预留里拿不同节点的，再去空闲位图里领。
+ */
+static int rs_take_other(struct rs_map *m, u16 exclude, u32 *loc)
+{
+	struct rs_reserve *r = rs_reserve_this();
+	u8 i;
+
+	for (i = 0; i < r->n; i++) {
+		if (rs_loc_node(m, r->loc[i]) == exclude)
+			continue;
+		*loc = r->loc[i];
+		r->loc[i] = r->loc[--r->n];
+		return 0;
+	}
+	return rs_claim_other(m, exclude, loc);
+}
+
 static void rs_release_loc(struct rs_map *m, u32 loc)
 {
 	struct rs_reserve *r = rs_reserve_this();
@@ -303,11 +395,61 @@ static int rs_fill(struct rs_map *m, u32 loc, u32 slot, struct rs_remote *out)
 	return 0;
 }
 
+static u8 rs_bound_mask(const struct rs_extent *ext)
+{
+	u8 bound = 0;
+
+	if (ext->loc0 != RS_LOC_NONE)
+		bound |= RS_S_C0;
+	if (ext->loc1 != RS_LOC_NONE)
+		bound |= RS_S_C1;
+	return bound;
+}
+
+static u8 rs_wanted_mask(const struct rs_map *m, u8 bound)
+{
+	if (m->prot == RS_PROT_REPLICA2)
+		return RS_S_C0 | RS_S_C1;
+	return bound & RS_S_C0;
+}
+
 static int rs_bind_extent(struct rs_map *m, struct rs_extent *ext)
 {
+	u16 node;
+	int ret;
+
 	if (ext->loc0 != RS_LOC_NONE)
 		return 0;
-	return rs_pop_loc(m, &ext->loc0);
+	ret = rs_pop_loc(m, &ext->loc0);
+	if (ret)
+		return ret;
+	if (m->prot != RS_PROT_REPLICA2)
+		return 0;
+	node = rs_loc_node(m, ext->loc0);
+	if (rs_take_other(m, node, &ext->loc1))
+		ext->loc1 = RS_LOC_NONE;
+	return 0;
+}
+
+static int rs_emit_copies(struct rs_map *m, struct rs_extent *ext, u32 slot,
+			  u8 bits, struct rs_copies *out)
+{
+	u32 locs[RS_NR_COPIES];
+	u32 i;
+	u8 mask = 0;
+
+	locs[0] = ext->loc0;
+	locs[1] = ext->loc1;
+	memset(out, 0, sizeof(*out));
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if (!(bits & (1u << i)) || locs[i] == RS_LOC_NONE)
+			continue;
+		if (rs_fill(m, locs[i], slot, &out->r[i]))
+			return -EIO;
+		mask |= (u8)(1u << i);
+	}
+	out->mask = mask;
+	return 0;
 }
 
 int rs_map_init(u32 capacity_mb)
@@ -477,7 +619,7 @@ out:
 	return changed;
 }
 
-static int rs_activate(struct rs_map *m, u32 slot, struct rs_remote *out)
+static int rs_activate(struct rs_map *m, u32 slot, struct rs_copies *out)
 {
 	u32 ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
 	struct rs_extent *ext = &m->extents[ext_i];
@@ -489,22 +631,52 @@ static int rs_activate(struct rs_map *m, u32 slot, struct rs_remote *out)
 	ret = rs_bind_extent(m, ext);
 	if (ret)
 		return ret;
+	ret = rs_emit_copies(m, ext, slot, rs_bound_mask(ext), out);
+	if (ret)
+		return ret;
 	if (!(state & RS_S_USED)) {
 		m->used_slots++;
 		ext->used++;
 	}
-	m->sstate[slot] = RS_S_USED | RS_S_C0 | RS_S_BUSY;
-	return rs_fill(m, ext->loc0, slot, out);
+	m->sstate[slot] = (state & (RS_S_C0 | RS_S_C1 | RS_S_SHORT | RS_S_USED)) |
+			  RS_S_USED | RS_S_BUSY;
+	return 0;
 }
 
-int rs_map_prepare_write(u64 off, u32 len, struct rs_remote *out)
+int rs_map_set_protection(u32 mode)
+{
+	struct rs_map *m = rs_map;
+	unsigned long flags;
+	int ret = 0;
+
+	if (mode != RS_PROT_SINGLE && mode != RS_PROT_REPLICA2)
+		return -EINVAL;
+	if (!m)
+		return -ENODEV;
+	spin_lock_irqsave(&m->lock, flags);
+	if (m->used_slots)
+		ret = -EBUSY;
+	else
+		m->prot = (u8)mode;
+	spin_unlock_irqrestore(&m->lock, flags);
+	return ret;
+}
+
+u32 rs_map_protection(void)
+{
+	struct rs_map *m = rs_map;
+
+	return m ? m->prot : RS_PROT_SINGLE;
+}
+
+int rs_map_prepare_write(u64 off, u32 len, struct rs_copies *out)
 {
 	struct rs_map *m = rs_map;
 	unsigned long flags;
 	u32 slot;
 	int ret;
 
-	if (!m || len != RS_PAGE_SIZE)
+	if (!m || !out || len != RS_PAGE_SIZE)
 		return -EINVAL;
 	spin_lock_irqsave(&m->lock, flags);
 	ret = rs_slot(m, off, len, &slot);
@@ -514,7 +686,7 @@ int rs_map_prepare_write(u64 off, u32 len, struct rs_remote *out)
 	return ret;
 }
 
-int rs_map_lookup_read(u64 off, u32 len, struct rs_remote *out)
+int rs_map_lookup_read(u64 off, u32 len, struct rs_copies *out)
 {
 	struct rs_map *m = rs_map;
 	u32 slot, ext_i;
@@ -523,7 +695,7 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_remote *out)
 	u8 state;
 	int ret;
 
-	if (!m || len != RS_PAGE_SIZE)
+	if (!m || !out || len != RS_PAGE_SIZE)
 		return -EINVAL;
 	spin_lock_irqsave(&m->lock, flags);
 	ret = rs_slot(m, off, len, &slot);
@@ -544,14 +716,14 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_remote *out)
 	}
 	ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
 	ext = &m->extents[ext_i];
-	if (ext->loc0 == RS_LOC_NONE) {
-		ret = RS_MAP_ZERO;
+	ret = rs_emit_copies(m, ext, slot, state & (RS_S_C0 | RS_S_C1), out);
+	if (ret)
+		goto out;
+	if (!out->mask) {
+		ret = -EIO;
 		goto out;
 	}
 	m->sstate[slot] = state | RS_S_BUSY;
-	ret = rs_fill(m, ext->loc0, slot, out);
-	if (ret)
-		m->sstate[slot] = state;
 out:
 	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
@@ -584,13 +756,18 @@ int rs_map_discard(u64 off, u32 len)
 
 		if (!(state & RS_S_USED))
 			continue;
+		if ((state & RS_S_SHORT) && m->degraded_slots)
+			m->degraded_slots--;
 		m->sstate[slot + i] = RS_S_ZERO;
 		if (m->used_slots)
 			m->used_slots--;
 		if (ext->used)
 			ext->used--;
-		if (!ext->used && ext->loc0 != RS_LOC_NONE) {
-			rs_release_loc(m, ext->loc0);
+		if (!ext->used) {
+			if (ext->loc0 != RS_LOC_NONE)
+				rs_release_loc(m, ext->loc0);
+			if (ext->loc1 != RS_LOC_NONE)
+				rs_release_loc(m, ext->loc1);
 			ext->loc0 = RS_LOC_NONE;
 			ext->loc1 = RS_LOC_NONE;
 		}
@@ -613,6 +790,42 @@ void rs_map_finish(u64 off)
 		return;
 	spin_lock_irqsave(&m->lock, flags);
 	m->sstate[slot] &= (u8)~RS_S_BUSY;
+	spin_unlock_irqrestore(&m->lock, flags);
+}
+
+/* 输入 ok_mask 的 bit0/bit1。有效副本改成其中已绑定的那些，并清 BUSY。 */
+void rs_map_finish_write(u64 off, u8 ok_mask)
+{
+	struct rs_map *m = rs_map;
+	struct rs_extent *ext;
+	unsigned long flags;
+	u32 slot, ext_i;
+	u8 state, bound, wanted, valid;
+	bool short_copy;
+
+	if (!m || (off & (RS_PAGE_SIZE - 1)))
+		return;
+	slot = off >> RS_PAGE_SHIFT;
+	if (slot >= m->nr_slots)
+		return;
+	spin_lock_irqsave(&m->lock, flags);
+	state = m->sstate[slot];
+	if (!(state & RS_S_USED)) {
+		m->sstate[slot] = state & (u8)~RS_S_BUSY;
+		goto out;
+	}
+	ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
+	ext = &m->extents[ext_i];
+	bound = rs_bound_mask(ext);
+	wanted = rs_wanted_mask(m, bound);
+	valid = ok_mask & bound & (RS_S_C0 | RS_S_C1);
+	short_copy = valid != wanted;
+	if (short_copy && !(state & RS_S_SHORT))
+		m->degraded_slots++;
+	else if (!short_copy && (state & RS_S_SHORT) && m->degraded_slots)
+		m->degraded_slots--;
+	m->sstate[slot] = RS_S_USED | valid | (short_copy ? RS_S_SHORT : 0);
+out:
 	spin_unlock_irqrestore(&m->lock, flags);
 }
 
@@ -673,5 +886,6 @@ void rs_map_stats(struct rs_map_stats *out)
 	out->nr_chunks = chunks;
 	out->nr_nodes = nodes;
 	out->free_extents = free_ext + rs_reserve_held();
+	out->degraded_slots = m->degraded_slots;
 	spin_unlock_irqrestore(&m->lock, flags);
 }

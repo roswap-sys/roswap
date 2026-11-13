@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/sched/mm.h>
 #include <linux/smp.h>
+#include <linux/string.h>
 #include <linux/version.h>
 
 #include "compat.h"
@@ -36,6 +37,10 @@ MODULE_PARM_DESC(chunk_size_mb, "remote chunk size in MiB");
 static uint capacity_mb;
 module_param(capacity_mb, uint, 0444);
 MODULE_PARM_DESC(capacity_mb, "logical disk size in MiB, defaults to chunk_size_mb");
+
+static char *protection = "single";
+module_param(protection, charp, 0444);
+MODULE_PARM_DESC(protection, "single or replica2");
 
 struct rs_link;
 
@@ -75,16 +80,27 @@ struct rs_link {
 	struct work_struct connect_rest;
 };
 
-struct roswap_cmd {
+struct roswap_cmd;
+
+struct rs_wr {
 	struct ib_cqe cqe;
-	struct rs_qp *qp;
+	struct roswap_cmd *cmd;
+	u8 which;
+};
+
+struct roswap_cmd {
+	struct rs_wr wr[RS_NR_COPIES];
+	struct rs_qp *qp[RS_NR_COPIES];
+	struct ib_device *dev;
 	bool *done_flag;
+	atomic_t copy_word;
 	u64 dma;
 	u64 off;
 	u32 len;
-	u32 gid;
-	u32 gen;
+	u32 gid[RS_NR_COPIES];
+	u32 gen[RS_NR_COPIES];
 	enum dma_data_direction dir;
+	u8 sent_mask;
 };
 
 static u32 rs_capacity_mb;
@@ -102,7 +118,6 @@ static void rs_fault_poll_work(struct work_struct *work);
 static void rs_connect_rest(struct work_struct *work);
 static void rs_link_failed(struct rs_qp *qp);
 static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc);
-static void rs_fail_request(struct rs_qp *qp, struct request *rq);
 static void rs_reap_orphans(struct rs_qp *qp, struct ib_device *dev);
 
 static unsigned int rs_primary_cpu(void)
@@ -213,20 +228,284 @@ static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd, bool *done)
 		queue_work(roswap_wq, &qp->poll_work);
 }
 
+enum {
+	RS_QP_NONE = 0,
+	RS_QP_READY,
+	RS_QP_RETRY,
+	RS_QP_DEAD,
+};
+
+struct rs_pick {
+	struct rs_qp *qp;
+	u8 kind;
+};
+
+static int rs_qp_kind(struct rs_qp *qp, struct rs_link *link)
+{
+	if (qp && atomic_read_acquire(&qp->state) == RS_LINK_UP && qp->cm_id)
+		return RS_QP_READY;
+	if (!qp || !link || READ_ONCE(link->fatal) || READ_ONCE(qp->stop))
+		return RS_QP_DEAD;
+	if (atomic_read(&qp->state) == RS_LINK_OFF)
+		rs_qp_kick(qp);
+	return RS_QP_RETRY;
+}
+
+/* 输入副本表。输出每个副本的 QP 状态，*retry 表示还有链路能再试。 */
+static void rs_classify(const struct rs_copies *copies, bool read,
+			struct rs_pick *pick, bool *retry)
+{
+	u32 i;
+
+	*retry = false;
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		struct rs_link *link = NULL;
+		struct rs_qp *qp = NULL;
+
+		pick[i].qp = NULL;
+		pick[i].kind = RS_QP_NONE;
+		if (!(copies->mask & (1u << i)))
+			continue;
+		rcu_read_lock();
+		link = rs_link_find(copies->r[i].node_id);
+		/* 只用来挑 QP，被迁走也没关系；queue_rq 不保证关抢占。 */
+		qp = rs_qp_for(link, raw_smp_processor_id(), read);
+		rcu_read_unlock();
+		pick[i].qp = qp;
+		pick[i].kind = (u8)rs_qp_kind(qp, link);
+		if (pick[i].kind == RS_QP_RETRY)
+			*retry = true;
+	}
+}
+
+static u8 rs_ready_mask(const struct rs_pick *pick, bool first_only)
+{
+	u8 mask = 0;
+	u32 i;
+
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if (pick[i].kind != RS_QP_READY)
+			continue;
+		mask |= (u8)(1u << i);
+		if (first_only)
+			break;
+	}
+	return mask;
+}
+
+static void rs_inflight_put(struct rs_qp *qp)
+{
+	int cur;
+
+	if (!qp)
+		return;
+	do {
+		cur = atomic_read(&qp->inflight);
+		if (cur <= 0)
+			return;
+	} while (atomic_cmpxchg(&qp->inflight, cur, cur - 1) != cur);
+}
+
+/* 发出去的副本都没了路可退才报错，否则交回 blk-mq 再试。 */
+static void rs_fail_cmd(struct roswap_cmd *cmd, struct request *rq)
+{
+	u32 i;
+	bool retry = false;
+
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		struct rs_qp *qp;
+
+		if (!(cmd->sent_mask & (1u << i)))
+			continue;
+		qp = cmd->qp[i];
+		if (!qp || READ_ONCE(qp->stop) || READ_ONCE(qp->link->fatal) ||
+		    atomic_read(&qp->state) == RS_LINK_OFF)
+			continue;
+		retry = true;
+	}
+	if (retry)
+		blk_mq_requeue_request(rq, true);
+	else
+		blk_mq_end_request(rq, BLK_STS_IOERR);
+}
+
+/* 输入已经到齐的完成字。解除这一页的 DMA，再按成功掩码结束请求。 */
+static void rs_finish_cmd(struct roswap_cmd *cmd)
+{
+	struct request *rq = blk_mq_rq_from_pdu(cmd);
+	u8 ok = rs_copy_ok((u32)atomic_read(&cmd->copy_word));
+
+	ib_dma_unmap_page(cmd->dev, cmd->dma, cmd->len, cmd->dir);
+	if (cmd->dir == DMA_FROM_DEVICE) {
+		rs_map_finish(cmd->off);
+		if (ok)
+			blk_mq_end_request(rq, BLK_STS_OK);
+		else
+			rs_fail_cmd(cmd, rq);
+		return;
+	}
+	rs_map_finish_write(cmd->off, ok);
+	if (ok)
+		blk_mq_end_request(rq, BLK_STS_OK);
+	else
+		rs_fail_cmd(cmd, rq);
+}
+
+/* 登记一份副本。重复登记直接忽略。返回这次是不是新到达。 */
+static bool rs_settle(struct roswap_cmd *cmd, u32 which, bool success, bool posted)
+{
+	u32 old, new;
+
+	if (cmd->done_flag)
+		*cmd->done_flag = true;
+	do {
+		old = (u32)atomic_read(&cmd->copy_word);
+		new = rs_copy_note(old, which, success);
+		if (new == old)
+			return false;
+	} while ((u32)atomic_cmpxchg(&cmd->copy_word, (int)old, (int)new) != old);
+
+	if (posted)
+		rs_inflight_put(cmd->qp[which]);
+	if (rs_copy_settled(new, cmd->sent_mask))
+		rs_finish_cmd(cmd);
+	return true;
+}
+
+static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct rs_wr *wr = container_of(wc->wr_cqe, struct rs_wr, cqe);
+	struct roswap_cmd *cmd = wr->cmd;
+	struct rs_qp *qp = cmd->qp[wr->which];
+	bool ok = wc->status == IB_WC_SUCCESS;
+
+	(void)cq;
+	if (!ok) {
+		pr_err_ratelimited("rdma %s failed: %s\n",
+				   cmd->dir == DMA_TO_DEVICE ? "write" : "read",
+				   ib_wc_status_msg(wc->status));
+		/*
+		 * rkey 已经换过就直接重试。还是这一把钥匙，就停在原地等
+		 * CHUNK_UPDATE，不要拿旧钥匙重连空转。
+		 */
+		if (qp && rs_wc_permanent(wc->status) &&
+		    rs_map_chunk_gen(cmd->gid[wr->which]) == cmd->gen[wr->which])
+			WRITE_ONCE(qp->key_wait, true);
+		rs_link_failed(qp);
+	}
+	rs_settle(cmd, wr->which, ok, true);
+}
+
+static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
+				   const struct rs_copies *copies,
+				   const struct rs_pick *pick, u8 ready,
+				   const struct bio_vec *bv, u64 off, bool read)
+{
+	struct ib_device *dev = NULL;
+	bool done = false;
+	u32 i;
+	int nposted = 0;
+
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if (!(ready & (1u << i)))
+			continue;
+		dev = pick[i].qp->cm_id->device;
+		break;
+	}
+	if (!dev) {
+		rs_map_finish(off);
+		return BLK_STS_IOERR;
+	}
+
+	cmd->dev = dev;
+	cmd->off = off;
+	cmd->len = bv->bv_len;
+	cmd->dir = read ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+	cmd->sent_mask = ready;
+	cmd->done_flag = NULL;
+	atomic_set(&cmd->copy_word, 0);
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		cmd->qp[i] = NULL;
+		cmd->wr[i].cmd = cmd;
+		cmd->wr[i].which = (u8)i;
+		cmd->wr[i].cqe.done = NULL;
+		if (!(ready & (1u << i)))
+			continue;
+		cmd->qp[i] = pick[i].qp;
+		cmd->gid[i] = copies->r[i].gid;
+		cmd->gen[i] = copies->r[i].gen;
+	}
+	cmd->dma = ib_dma_map_page(dev, bv->bv_page, bv->bv_offset, bv->bv_len,
+				   cmd->dir);
+	if (ib_dma_mapping_error(dev, cmd->dma)) {
+		rs_map_finish(off);
+		return BLK_STS_RESOURCE;
+	}
+
+	blk_mq_start_request(rq);
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		struct ib_rdma_wr wr = {};
+		struct ib_sge sge;
+		struct rs_qp *qp;
+
+		if (!(ready & (1u << i)))
+			continue;
+		qp = cmd->qp[i];
+		sge.addr = cmd->dma;
+		sge.length = cmd->len;
+		sge.lkey = rs_pd->local_dma_lkey;
+		cmd->wr[i].cqe.done = rs_rdma_done;
+		if (read && qp->poll_direct)
+			cmd->done_flag = &done;
+		wr.wr.opcode = read ? IB_WR_RDMA_READ : IB_WR_RDMA_WRITE;
+		wr.wr.wr_cqe = &cmd->wr[i].cqe;
+		wr.wr.sg_list = &sge;
+		wr.wr.num_sge = 1;
+		wr.wr.send_flags = IB_SEND_SIGNALED;
+		wr.remote_addr = copies->r[i].addr;
+		wr.rkey = copies->r[i].rkey;
+		atomic_inc(&qp->inflight);
+		if (ib_post_send(qp->cm_id->qp, &wr.wr, NULL)) {
+			u32 j;
+
+			rs_inflight_put(qp);
+			rs_link_failed(qp);
+			if (!nposted) {
+				/*
+				 * 请求还在 tag 里，回收会按 qp 指针再结算一次。
+				 * 清掉发送掩码，这次失败只由这里收尾。
+				 */
+				cmd->done_flag = NULL;
+				cmd->sent_mask = 0;
+				for (j = 0; j < RS_NR_COPIES; j++)
+					cmd->qp[j] = NULL;
+				ib_dma_unmap_page(dev, cmd->dma, cmd->len, cmd->dir);
+				rs_map_finish(off);
+				blk_mq_requeue_request(rq, true);
+				return BLK_STS_OK;
+			}
+			rs_settle(cmd, i, false, false);
+			return BLK_STS_OK;
+		}
+		nposted++;
+		if (read && qp->poll_direct)
+			rs_fault_poll(qp, cmd, &done);
+	}
+	return BLK_STS_OK;
+}
+
 static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 				const struct blk_mq_queue_data *bd)
 {
 	struct request *rq = bd->rq;
 	struct roswap_cmd *cmd = blk_mq_rq_to_pdu(rq);
-	struct rs_remote remote;
-	struct rs_link *link;
-	struct rs_qp *qp;
-	struct ib_rdma_wr wr = {};
-	struct ib_sge sge;
+	struct rs_copies copies;
+	struct rs_pick pick[RS_NR_COPIES];
 	struct bio_vec bv;
 	bool read = req_op(rq) == REQ_OP_READ;
-	bool done = false;
+	bool retry = false;
 	u64 off;
+	u8 ready;
 	int ret;
 
 	(void)hctx;
@@ -250,9 +529,9 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_IOERR;
 	off = (u64)blk_rq_pos(rq) << SECTOR_SHIFT;
 	if (read)
-		ret = rs_map_lookup_read(off, bv.bv_len, &remote);
+		ret = rs_map_lookup_read(off, bv.bv_len, &copies);
 	else
-		ret = rs_map_prepare_write(off, bv.bv_len, &remote);
+		ret = rs_map_prepare_write(off, bv.bv_len, &copies);
 	if (ret == RS_MAP_ZERO) {
 		rs_zero_page(bv.bv_page, bv.bv_offset, bv.bv_len);
 		blk_mq_start_request(rq);
@@ -266,104 +545,18 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (ret)
 		return BLK_STS_IOERR;
 
-	rcu_read_lock();
-	link = rs_link_find(remote.node_id);
-	/* 只用来挑 QP，被迁走也没关系；queue_rq 不保证关抢占。 */
-	qp = rs_qp_for(link, raw_smp_processor_id(), read);
-	rcu_read_unlock();
-	if (!qp || !qp->cm_id || atomic_read(&qp->state) != RS_LINK_UP) {
+	rs_classify(&copies, read, pick, &retry);
+	ready = rs_ready_mask(pick, read);
+	if (!ready) {
 		rs_map_finish(off);
 		/* stop 之后没人会再拉起链路，返回 RESOURCE 会让 del_gendisk 永远等。 */
-		if (!qp || READ_ONCE(link->fatal) || READ_ONCE(qp->stop))
-			return BLK_STS_IOERR;
-		rs_qp_kick(qp);
-		return BLK_STS_RESOURCE;
+		return retry ? BLK_STS_RESOURCE : BLK_STS_IOERR;
 	}
-
-	cmd->qp = qp;
-	cmd->done_flag = qp->poll_direct ? &done : NULL;
-	cmd->off = off;
-	cmd->len = bv.bv_len;
-	cmd->gid = remote.gid;
-	cmd->gen = remote.gen;
-	cmd->dir = read ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
-	cmd->dma = ib_dma_map_page(qp->cm_id->device, bv.bv_page, bv.bv_offset,
-				   bv.bv_len, cmd->dir);
-	if (ib_dma_mapping_error(qp->cm_id->device, cmd->dma)) {
-		rs_map_finish(off);
-		return BLK_STS_RESOURCE;
-	}
-
-	sge.addr = cmd->dma;
-	sge.length = cmd->len;
-	sge.lkey = rs_pd->local_dma_lkey;
-	cmd->cqe.done = NULL;
-	wr.wr.opcode = read ? IB_WR_RDMA_READ : IB_WR_RDMA_WRITE;
-	wr.wr.wr_cqe = &cmd->cqe;
-	wr.wr.sg_list = &sge;
-	wr.wr.num_sge = 1;
-	wr.wr.send_flags = IB_SEND_SIGNALED;
-	wr.remote_addr = remote.addr;
-	wr.rkey = remote.rkey;
-
-	blk_mq_start_request(rq);
-	cmd->cqe.done = rs_rdma_done;
-	atomic_inc(&qp->inflight);
-	if (ib_post_send(qp->cm_id->qp, &wr.wr, NULL)) {
-		ib_dma_unmap_page(qp->cm_id->device, cmd->dma, cmd->len, cmd->dir);
-		atomic_dec(&qp->inflight);
-		rs_map_finish(off);
-		rs_link_failed(qp);
-		blk_mq_requeue_request(rq, true);
-		return BLK_STS_OK;
-	}
-	if (qp->poll_direct)
-		rs_fault_poll(qp, cmd, &done);
-	return BLK_STS_OK;
-}
-
-static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
-{
-	struct roswap_cmd *cmd = container_of(wc->wr_cqe, struct roswap_cmd, cqe);
-	struct request *rq = blk_mq_rq_from_pdu(cmd);
-	struct rs_qp *qp = cmd->qp;
-
-	if (cmd->done_flag)
-		*cmd->done_flag = true;
-	ib_dma_unmap_page(cq->device, cmd->dma, cmd->len, cmd->dir);
-	rs_map_finish(cmd->off);
-	if (wc->status == IB_WC_SUCCESS) {
-		blk_mq_end_request(rq, BLK_STS_OK);
-	} else {
-		pr_err_ratelimited("rdma %s failed: %s\n",
-				   cmd->dir == DMA_TO_DEVICE ? "write" : "read",
-				   ib_wc_status_msg(wc->status));
-		/*
-		 * rkey 已经换过就直接重试。还是这一把钥匙，就停在原地等
-		 * CHUNK_UPDATE，不要拿旧钥匙重连空转。
-		 */
-		if (rs_wc_permanent(wc->status) &&
-		    rs_map_chunk_gen(cmd->gid) == cmd->gen)
-			WRITE_ONCE(qp->key_wait, true);
-		rs_link_failed(qp);
-		rs_fail_request(qp, rq);
-	}
-	atomic_dec(&qp->inflight);
-}
-
-/* 链路已经放弃就报错，否则交回 blk-mq 等链路恢复后重发。 */
-static void rs_fail_request(struct rs_qp *qp, struct request *rq)
-{
-	if (READ_ONCE(qp->stop) || READ_ONCE(qp->link->fatal) ||
-	    atomic_read(&qp->state) == RS_LINK_OFF)
-		blk_mq_end_request(rq, BLK_STS_IOERR);
-	else
-		blk_mq_requeue_request(rq, true);
+	return rs_post_copies(rq, cmd, &copies, pick, ready, &bv, off, read);
 }
 
 struct rs_reap_ctx {
 	struct rs_qp *qp;
-	struct ib_device *dev;
 	int n;
 };
 
@@ -371,14 +564,16 @@ static bool rs_reap_one(ROSWAP_BUSY_ITER_ARGS)
 {
 	struct rs_reap_ctx *ctx = data;
 	struct roswap_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	u32 i;
 
-	if (cmd->qp != ctx->qp)
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if ((cmd->sent_mask & (1u << i)) && cmd->qp[i] == ctx->qp)
+			break;
+	}
+	if (i == RS_NR_COPIES)
 		return true;
-	ib_dma_unmap_page(ctx->dev, cmd->dma, cmd->len, cmd->dir);
-	rs_map_finish(cmd->off);
-	rs_fail_request(ctx->qp, rq);
-	atomic_dec(&ctx->qp->inflight);
-	ctx->n++;
+	if (rs_settle(cmd, i, false, true))
+		ctx->n++;
 	return true;
 }
 
@@ -389,8 +584,9 @@ static bool rs_reap_one(ROSWAP_BUSY_ITER_ARGS)
  */
 static void rs_reap_orphans(struct rs_qp *qp, struct ib_device *dev)
 {
-	struct rs_reap_ctx ctx = { .qp = qp, .dev = dev };
+	struct rs_reap_ctx ctx = { .qp = qp };
 
+	(void)dev;
 	if (!roswap_disk || atomic_read(&qp->inflight) <= 0)
 		return;
 	blk_mq_tagset_busy_iter(&roswap_tag_set, rs_reap_one, &ctx);
@@ -559,6 +755,7 @@ static int rs_qp_connect(struct rs_qp *qp)
 		goto err_cq;
 
 	param.initiator_depth = min_t(int, id->device->attrs.max_qp_init_rd_atom, 16);
+	rdma_set_ack_timeout(id, ROSWAP_ACK_TIMEOUT);
 	reinit_completion(&qp->cm_done);
 	ret = rdma_connect(id, &param);
 	if (!ret)
@@ -623,7 +820,8 @@ static void rs_unquiesce(bool *quiesced)
 
 static void rs_mark_up(struct rs_qp *qp)
 {
-	atomic_set(&qp->state, RS_LINK_UP);
+	/* release 让 queue_rq 看到 UP 时，也能看到上面刚写好的 cm_id。 */
+	atomic_set_release(&qp->state, RS_LINK_UP);
 	if (READ_ONCE(qp->link_lost) && !READ_ONCE(qp->stop))
 		rs_link_failed(qp);
 }
@@ -690,7 +888,7 @@ static void rs_qp_recover(struct work_struct *work)
 		mutex_unlock(&rs_qp_mu);
 		goto out;
 	}
-	atomic_set(&qp->state, RS_LINK_RECOVERING);
+	atomic_set_release(&qp->state, RS_LINK_RECOVERING);
 	if (!qp->recover_deadline)
 		qp->recover_deadline = jiffies + msecs_to_jiffies(ROSWAP_RECOVER_LIMIT_MS);
 	if (roswap_disk) {
@@ -699,6 +897,12 @@ static void rs_qp_recover(struct work_struct *work)
 	}
 	cancel_work_sync(&qp->poll_work);
 	rs_qp_teardown(qp);
+	/*
+	 * replica2 还有另一份副本。拆完旧 QP 就放开队列，重连期间别的节点继续服务。
+	 * single 只有这一条链路，保持冻结到重连结束。
+	 */
+	if (rs_map_protection() == RS_PROT_REPLICA2)
+		rs_unquiesce(&quiesced);
 	while (!rs_give_up(qp)) {
 		ret = rs_qp_connect(qp);
 		if (rs_give_up(qp))
@@ -1129,9 +1333,18 @@ static void rs_free_links(void)
 	}
 }
 
+static int rs_protection_mode(void)
+{
+	if (protection && !strcmp(protection, "single"))
+		return RS_PROT_SINGLE;
+	if (protection && !strcmp(protection, "replica2"))
+		return RS_PROT_REPLICA2;
+	return -EINVAL;
+}
+
 static int __init roswap_init(void)
 {
-	int ret;
+	int ret, mode;
 
 	rs_capacity_mb = capacity_mb ? capacity_mb : chunk_size_mb;
 	if (!rs_capacity_mb) {
@@ -1142,9 +1355,17 @@ static int __init roswap_init(void)
 		pr_err("chunk_size_mb must be non-zero\n");
 		return -EINVAL;
 	}
+	mode = rs_protection_mode();
+	if (mode < 0) {
+		pr_err("protection must be single or replica2\n");
+		return -EINVAL;
+	}
 	ret = rs_map_init(rs_capacity_mb);
 	if (ret)
 		return ret;
+	ret = rs_map_set_protection((u32)mode);
+	if (ret)
+		goto err_map;
 	roswap_wq = alloc_workqueue("roswap", WQ_MEM_RECLAIM, 0);
 	if (!roswap_wq) {
 		ret = -ENOMEM;
