@@ -314,21 +314,62 @@ pub fn sockaddr_from_v4(addr: SocketAddrV4) -> sys::sockaddr_in {
     }
 }
 
+/// IPv4 address published in this device's GID table.
+///
+/// `rdma_cm` attaches a listener to the HCA that owns the matching GID. The
+/// netdev's primary address can be absent from that table (an IPv6 GID still
+/// names the same netdev), and binding it then leaves the id on another
+/// device, or on none.
 pub fn rdma_dev_ipv4(dev_name: &str) -> Option<Ipv4Addr> {
-    let net_dir = std::path::Path::new("/sys/class/infiniband")
+    let port = std::path::Path::new("/sys/class/infiniband")
         .join(dev_name)
-        .join("ports/1/gid_attrs/ndevs");
-    if let Ok(ndevs) = std::fs::read_dir(net_dir) {
-        for ndev in ndevs.flatten() {
-            if let Ok(ifname) = std::fs::read_to_string(ndev.path()) {
-                let ifname = ifname.trim();
-                if let Some(ip) = ipv4_of_interface(ifname) {
-                    return Some(ip);
-                }
-            }
+        .join("ports/1");
+    let entries = std::fs::read_dir(port.join("gids")).ok()?;
+    let mut indexes: Vec<u32> = entries
+        .flatten()
+        .filter_map(|ent| ent.file_name().to_str()?.parse().ok())
+        .collect();
+    indexes.sort_unstable();
+    let mut fallback = None;
+    for index in indexes {
+        let Ok(text) = std::fs::read_to_string(port.join("gids").join(index.to_string())) else {
+            continue;
+        };
+        let Some(ip) = ipv4_from_gid(&text) else {
+            continue;
+        };
+        let kind = std::fs::read_to_string(port.join("gid_attrs/types").join(index.to_string()))
+            .unwrap_or_default();
+        if kind.to_ascii_lowercase().contains("roce v2") {
+            return Some(ip);
+        }
+        if fallback.is_none() {
+            fallback = Some(ip);
         }
     }
-    None
+    fallback
+}
+
+fn ipv4_from_gid(text: &str) -> Option<Ipv4Addr> {
+    let groups: Vec<&str> = text.trim().split(':').collect();
+    if groups.len() != 8 {
+        return None;
+    }
+    let groups: Vec<String> = groups
+        .into_iter()
+        .map(|group| group.to_ascii_lowercase())
+        .collect();
+    if groups[..5].iter().any(|group| group != "0000") || groups[5] != "ffff" {
+        return None;
+    }
+    let hi = u16::from_str_radix(&groups[6], 16).ok()?;
+    let lo = u16::from_str_radix(&groups[7], 16).ok()?;
+    let ip = Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 pub fn local_rdma_ipv4() -> Option<Ipv4Addr> {
@@ -342,38 +383,6 @@ pub fn local_rdma_ipv4() -> Option<Ipv4Addr> {
         }
     }
     None
-}
-
-fn ipv4_of_interface(ifname: &str) -> Option<Ipv4Addr> {
-    #[repr(C)]
-    struct ifreq {
-        ifr_name: [u8; 16],
-        ifr_addr: sys::sockaddr_in,
-        _pad: [u8; 8],
-    }
-    extern "C" {
-        fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
-        fn ioctl(fd: i32, request: u64, ...) -> i32;
-        fn close(fd: i32) -> i32;
-    }
-    const SIOCGIFADDR: u64 = 0x8915;
-    unsafe {
-        let fd = socket(sys::AF_INET as i32, 2, 0);
-        if fd < 0 {
-            return None;
-        }
-        let mut ifr: ifreq = std::mem::zeroed();
-        let bytes = ifname.as_bytes();
-        let copy_len = bytes.len().min(15);
-        ifr.ifr_name[..copy_len].copy_from_slice(&bytes[..copy_len]);
-        let rc = ioctl(fd, SIOCGIFADDR, &mut ifr);
-        let _ = close(fd);
-        if rc != 0 {
-            return None;
-        }
-        let octets = ifr.ifr_addr.sin_addr.s_addr.to_ne_bytes();
-        Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
-    }
 }
 
 #[cfg(test)]
@@ -445,6 +454,27 @@ mod tests {
             chunk_size_error(512, (512 << 20) + 4096),
             Some("chunk_size_mb mismatch")
         );
+    }
+
+    #[test]
+    fn ipv4_mapped_gid_decodes_the_address() {
+        assert_eq!(
+            ipv4_from_gid("0000:0000:0000:0000:0000:ffff:0a01:000e\n"),
+            Some(Ipv4Addr::new(10, 1, 0, 14))
+        );
+        assert_eq!(
+            ipv4_from_gid("0000:0000:0000:0000:0000:FFFF:c0a8:5801"),
+            Some(Ipv4Addr::new(192, 168, 88, 1))
+        );
+        assert_eq!(
+            ipv4_from_gid("fe80:0000:0000:0000:0200:00ff:fe00:0001"),
+            None
+        );
+        assert_eq!(
+            ipv4_from_gid("0000:0000:0000:0000:0000:ffff:0000:0000"),
+            None
+        );
+        assert_eq!(ipv4_from_gid("0000:0000:0000:0000:0000:ffff:0a01"), None);
     }
 
     #[test]

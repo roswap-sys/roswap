@@ -30,13 +30,40 @@ jobs:
 
     - name: Setup Soft-RoCE (rdma_rxe)
       run: |
+        sudo modprobe dummy
         sudo modprobe rdma_rxe || sudo modprobe siw
         sudo modprobe rdma_ucm || true
-        NETDEV=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-        echo "Binding RDMA device to netdev: $NETDEV"
-        sudo rdma link add rxe0 type rxe netdev "$NETDEV" || sudo rdma link add siw0 type siw netdev "$NETDEV"
+        # The runner's default NIC often has only an IPv6 GID. rdma_cm will
+        # not bind that NIC's IPv4 to rxe0. A dummy address added after the
+        # device exists is published as an IPv4-mapped GID.
+        sudo ip link add roswap0 type dummy
+        sudo ip link set roswap0 up
+        sudo rdma link add rxe0 type rxe netdev roswap0 || sudo rdma link add siw0 type siw netdev roswap0
+        sudo ip addr add 192.168.88.1/24 dev roswap0
+        found=0
+        for _ in $(seq 1 25); do
+          if grep -Rqi 'ffff:c0a8:5801' /sys/class/infiniband/*/ports/1/gids 2>/dev/null; then
+            found=1
+            break
+          fi
+          sleep 0.2
+        done
         rdma link show
+        ip -4 addr show roswap0
+        echo "--- gids ---"
+        for f in /sys/class/infiniband/*/ports/1/gids/*; do
+          [ -f "$f" ] || continue
+          gid=$(cat "$f")
+          case "$gid" in
+            0000:0000:0000:0000:0000:0000:0000:0000) continue ;;
+          esac
+          echo "$f: $gid"
+        done
         ibv_devices || true
+        if [ "$found" -ne 1 ]; then
+          echo "Soft-RoCE did not publish 192.168.88.1 in its GID table" >&2
+          exit 1
+        fi
     - name: Build
       run: cargo build --verbose
     - name: Run tests

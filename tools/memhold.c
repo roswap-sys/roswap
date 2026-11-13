@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PAGE 4096
@@ -33,6 +34,9 @@ static int last_ok = -1;
 static size_t last_bytes;
 static char line[128];
 static size_t line_len;
+static uint64_t lat_bucket[64];
+static uint64_t lat_samples;
+static uint64_t lat_max_ns;
 
 static void prompt(void)
 {
@@ -130,9 +134,67 @@ static const char *verdict(int ok)
 	return ok ? "\033[32m校验通过\033[0m" : "\033[31m校验失败\033[0m";
 }
 
+static void lat_reset(void)
+{
+	memset(lat_bucket, 0, sizeof(lat_bucket));
+	lat_samples = 0;
+	lat_max_ns = 0;
+}
+
+static void lat_add(uint64_t ns)
+{
+	unsigned b = 0;
+	uint64_t v = ns;
+
+	if (ns > lat_max_ns)
+		lat_max_ns = ns;
+	while (v > 1 && b < 63) {
+		v >>= 1;
+		b++;
+	}
+	lat_bucket[b]++;
+	lat_samples++;
+}
+
+/* ppt 是千分位：500、990、999。返回落桶的上界。 */
+static uint64_t lat_pct(unsigned ppt)
+{
+	uint64_t need, acc = 0;
+	unsigned b;
+
+	if (!lat_samples)
+		return 0;
+	need = (lat_samples * ppt + 999) / 1000;
+	if (!need)
+		need = 1;
+	for (b = 0; b < 64; b++) {
+		uint64_t edge;
+
+		acc += lat_bucket[b];
+		if (acc < need)
+			continue;
+		edge = b == 63 ? lat_max_ns : (1ull << (b + 1));
+		return edge > lat_max_ns ? lat_max_ns : edge;
+	}
+	return lat_max_ns;
+}
+
+static void fmt_ns(char *dst, size_t n, uint64_t ns)
+{
+	if (ns < 1000)
+		snprintf(dst, n, "%lluns", (unsigned long long)ns);
+	else if (ns < 1000000ull)
+		snprintf(dst, n, "%lluus", (unsigned long long)((ns + 500) / 1000));
+	else if (ns < 1000000000ull)
+		snprintf(dst, n, "%llums", (unsigned long long)((ns + 500000) / 1000000));
+	else
+		snprintf(dst, n, "%llus", (unsigned long long)((ns + 500000000ull) / 1000000000ull));
+}
+
 static void print_status(int ok, size_t bad_off)
 {
 	char hold[32], rss[32], sw[32], off[32];
+	char p50[16], p99[16], p999[16], pmax[16];
 	unsigned long rss_kb, swap_kb;
 
 	read_vm(&rss_kb, &swap_kb);
@@ -146,6 +208,14 @@ static void print_status(int ok, size_t bad_off)
 		fmt_size(off, sizeof(off), bad_off);
 		printf("申请 %s | 物理 %s | 交换 %s | %s，偏移 %s\n",
 		       hold, rss, sw, verdict(0), off);
+	}
+	if (lat_samples) {
+		fmt_ns(p50, sizeof(p50), lat_pct(500));
+		fmt_ns(p99, sizeof(p99), lat_pct(990));
+		fmt_ns(p999, sizeof(p999), lat_pct(999));
+		fmt_ns(pmax, sizeof(pmax), lat_max_ns);
+		printf("换入 p50 %s | p99 %s | p999 %s | max %s\n",
+		       p50, p99, p999, pmax);
 	}
 	fflush(stdout);
 	last_rss_kb = rss_kb;
@@ -205,15 +275,26 @@ static void stamp(void)
 	}
 }
 
+static uint64_t elapsed_ns(const struct timespec *a, const struct timespec *b)
+{
+	return (uint64_t)(b->tv_sec - a->tv_sec) * 1000000000ull +
+	       (uint64_t)(b->tv_nsec - a->tv_nsec);
+}
+
 static int verify(size_t *bad_off)
 {
 	uint8_t *b = mem;
 	size_t i;
 
+	lat_reset();
 	for (i = 0; i < mem_bytes; i += PAGE) {
+		struct timespec t0, t1;
 		uint64_t v;
+		int timed = clock_gettime(CLOCK_MONOTONIC, &t0) == 0;
 
 		memcpy(&v, b + i, sizeof(v));
+		if (timed && clock_gettime(CLOCK_MONOTONIC, &t1) == 0)
+			lat_add(elapsed_ns(&t0, &t1));
 		if (v != i) {
 			*bad_off = i;
 			return 0;
