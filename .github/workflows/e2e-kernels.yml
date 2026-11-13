@@ -102,9 +102,6 @@ jobs:
         gcc -O2 -Wall -Wextra -o tools/blkcheck tools/blkcheck.c
         gcc -O2 -Wall -Wextra -o tools/memhold tools/memhold.c
 
-    # --disable-microvm：vng 在 KVM 下默认用 QEMU microvm 机型（virtio-mmio + 精简 ACPI），
-    # 老内核起不来。q35 + virtio-pci 所有版本都支持。
-    # --verbose 把内核控制台打出来，虚拟机没进到测试脚本时也能看到原因。
     - name: Run e2e in VM
       run: |
         out="$GITHUB_WORKSPACE/e2e-logs"
