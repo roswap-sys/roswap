@@ -62,11 +62,7 @@ jobs:
           bash .github/scripts/apt-install.sh "linux-modules-extra-$(uname -r)"
         fi
         sudo modprobe rdma_rxe
-        sudo ip link add roswap0 type veth peer name roswap1
-        sudo ip link set roswap0 up
-        sudo ip link set roswap1 up
-        sudo ip addr add 192.168.88.1/24 dev roswap0
-        sudo rdma link add rxe0 type rxe netdev roswap0
+        sudo tests/e2e/setup-rxe.sh
 
     - name: Block device
       run: sudo tests/e2e/run.sh blk

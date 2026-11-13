@@ -5,6 +5,15 @@
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <linux/version.h>
+#include <net/netlink.h>
+
+/*
+ * 5.11 把 nla_strlcpy 改名为 nla_strscpy，截断时返回 -E2BIG。
+ * 策略里已经限制了长度，旧接口不会截断，返回值只用来判负。
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
+#define nla_strscpy(dst, nla, size) ((ssize_t)nla_strlcpy(dst, nla, size))
+#endif
 
 /*
  * 5.17 起 GENHD_FL_NO_PART 是枚举常量，不是宏。#ifndef 看不出枚举，

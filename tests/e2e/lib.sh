@@ -110,6 +110,7 @@ stop_io_loop() {
 e2e_stop_stack() {
 	stop_io_loop || true
 	swapoff /dev/roswap0 2>/dev/null || true
+	rmdir /sys/fs/cgroup/roswap-e2e 2>/dev/null || true
 	if [[ -d /sys/module/roswap ]]; then
 		rmmod roswap || true
 	fi
@@ -214,7 +215,8 @@ provider_ready() {
 load_module() {
 	say "加载 roswap.ko"
 	# insmod 不处理依赖。rxe 只带起 ib_core，rdma_resolve_addr 这些符号在 rdma_cm 里。
-	modprobe rdma_cm
+	# 测试虚拟机把 rdma_cm 编进了内核，modprobe 找不到模块是正常的。
+	modprobe -q rdma_cm 2>/dev/null || true
 	insmod "$ROOT/kernel/roswap.ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB"
 	[[ -b /dev/roswap0 ]] || die "insmod 之后没有 /dev/roswap0"
 }

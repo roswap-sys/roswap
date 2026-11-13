@@ -4,6 +4,7 @@
 #include <linux/netlink.h>
 #include <net/genetlink.h>
 
+#include "compat.h"
 #include "roswap.h"
 
 static struct genl_family rs_family;

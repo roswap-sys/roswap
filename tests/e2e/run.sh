@@ -36,6 +36,26 @@ watch_swap_peak() {
 	done
 }
 
+E2E_CGROUP=/sys/fs/cgroup/roswap-e2e
+
+# 直接写 cgroup v2，不依赖 systemd：测试虚拟机里没有 systemd。
+setup_memcg() {
+	local root=/sys/fs/cgroup
+	if [[ $(stat -fc %T "$root" 2>/dev/null) != cgroup2fs ]]; then
+		if grep -q " $root " /proc/mounts; then
+			die "$root 不是 cgroup v2"
+		fi
+		mount -t cgroup2 none "$root"
+	fi
+	grep -qw memory "$root/cgroup.subtree_control" ||
+		echo +memory >"$root/cgroup.subtree_control"
+	mkdir -p "$E2E_CGROUP"
+	echo 64M >"$E2E_CGROUP/memory.max"
+	if [[ -f $E2E_CGROUP/memory.swap.max ]]; then
+		echo 128M >"$E2E_CGROUP/memory.swap.max"
+	fi
+}
+
 scenario_swap() {
 	local child sampler max rc=0
 	bring_up
@@ -46,9 +66,9 @@ scenario_swap() {
 	mkswap /dev/roswap0 >/dev/null
 	swapon -p 100 /dev/roswap0
 	say "cgroup 内换页并校验"
-	systemd-run --scope \
-		-p MemoryMax=64M -p MemorySwapMax=128M \
-		"$MEMHOLD" -m 96m -i 1 -n 4 &
+	setup_memcg
+	bash -c 'echo $$ >"$1/cgroup.procs" && shift && exec "$@"' _ \
+		"$E2E_CGROUP" "$MEMHOLD" -m 96m -i 1 -n 4 &
 	child=$!
 	watch_swap_peak "$child" &
 	sampler=$!
