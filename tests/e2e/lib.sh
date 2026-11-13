@@ -213,6 +213,8 @@ provider_ready() {
 
 load_module() {
 	say "加载 roswap.ko"
+	# insmod 不处理依赖。rxe 只带起 ib_core，rdma_resolve_addr 这些符号在 rdma_cm 里。
+	modprobe rdma_cm
 	insmod "$ROOT/kernel/roswap.ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB"
 	[[ -b /dev/roswap0 ]] || die "insmod 之后没有 /dev/roswap0"
 }
