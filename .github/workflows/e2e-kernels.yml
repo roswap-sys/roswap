@@ -44,10 +44,14 @@ jobs:
             experimental: true
     env:
       CC: ${{ matrix.cc || 'gcc' }}
-      KDIR: ${{ github.workspace }}/../linux-${{ matrix.kernel }}
 
     steps:
     - uses: actions/checkout@v4
+
+    # 内核树放在工作区外面，免得被 vng --rwdir 和 cargo 扫到。
+    # actions/cache 匹配路径时不处理 ".."，这里必须先展开成规范的绝对路径。
+    - name: Set kernel dir
+      run: echo "KDIR=$(dirname "$GITHUB_WORKSPACE")/linux-${{ matrix.kernel }}" >> "$GITHUB_ENV"
 
     - name: Install dependencies
       run: |
@@ -88,6 +92,13 @@ jobs:
           bash .github/scripts/kernel-tree.sh build "${{ matrix.kernel }}" "$KDIR"
 
     # 编完马上存。后面的测试失败也不用重新编内核。
+    # cache/save 找不到路径时只打警告，先确认内核树确实在。
+    - name: Check kernel build
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        test -f "$KDIR/.roswap-built"
+        du -sh "$KDIR"
+
     - name: Save kernel build
       if: steps.cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
