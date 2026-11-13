@@ -1,9 +1,13 @@
 name: e2e
 
+# host：在 runner 自己的内核上跑 blk / swap / fault，PR 上就跑。
+# vm：在 virtme-ng 虚拟机里换不同版本的内核跑同样的场景。每个内核第一次要完整编译，
+#     所以只在合进 master、每天定时和手动时运行。
+
 on:
   push:
     branches: [ "master" ]
-    paths:
+    paths: &paths
       - 'src/**'
       - 'kernel/**'
       - 'tools/**'
@@ -13,27 +17,24 @@ on:
       - 'Cargo.lock'
       - 'tests/e2e/**'
       - '.github/workflows/e2e.yml'
-      - '.github/scripts/apt-install.sh'
+      - '.github/scripts/**'
   pull_request:
     branches: [ "master" ]
-    paths:
-      - 'src/**'
-      - 'kernel/**'
-      - 'tools/**'
-      - 'proto/**'
-      - 'build.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'tests/e2e/**'
-      - '.github/workflows/e2e.yml'
-      - '.github/scripts/apt-install.sh'
+    paths: *paths
+  schedule:
+    - cron: '30 18 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  e2e:
+  host:
+    name: e2e on host kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 20
 
@@ -43,26 +44,19 @@ jobs:
     - name: Install build dependencies
       run: |
         bash .github/scripts/apt-install.sh \
-          build-essential \
-          linux-headers-$(uname -r) \
-          libibverbs-dev \
-          librdmacm-dev \
-          protobuf-compiler
+          build-essential linux-headers-$(uname -r) \
+          libibverbs-dev librdmacm-dev protobuf-compiler
+
+    - uses: Swatinem/rust-cache@v2
 
     - name: Build
       run: |
         make -C kernel
-        cargo build --release --bins
-        gcc -O2 -Wall -Wextra -o tools/blkcheck tools/blkcheck.c
-        gcc -O2 -Wall -Wextra -o tools/memhold tools/memhold.c
+        cargo build --locked --release --bins
+        make -C tools
 
     - name: Setup Soft-RoCE
-      run: |
-        if ! modinfo rdma_rxe >/dev/null 2>&1; then
-          bash .github/scripts/apt-install.sh "linux-modules-extra-$(uname -r)"
-        fi
-        sudo modprobe rdma_rxe
-        sudo tests/e2e/setup-rxe.sh
+      run: bash .github/scripts/setup-soft-roce.sh
 
     - name: Block device
       run: sudo tests/e2e/run.sh blk
@@ -74,32 +68,157 @@ jobs:
       run: sudo tests/e2e/run.sh fault
 
     - name: Collect logs
-      if: always()
+      if: failure()
       run: |
         mkdir -p e2e-logs
         sudo dmesg > e2e-logs/dmesg.txt || true
         if [ -d /tmp/roswap-e2e ]; then
           sudo cp -a /tmp/roswap-e2e/. e2e-logs/
         fi
-        sudo target/release/roswapctl status > e2e-logs/status.txt 2>&1 || true
-        sudo target/release/roswapctl cluster 127.0.0.1:12321 > e2e-logs/cluster.txt 2>&1 || true
         sudo chown -R "$(id -u):$(id -g)" e2e-logs
+
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-logs-host
+        path: e2e-logs
+        if-no-files-found: ignore
+
+  # roswapd 和测试工具与内核版本无关，编一次，分发给所有 vm job。
+  userspace:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: bash .github/scripts/apt-install.sh libibverbs-dev librdmacm-dev protobuf-compiler
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build
+      run: |
+        cargo build --locked --release --bins
+        make -C tools
+        # artifact 会丢掉可执行位，打成 tar 再传。
+        tar -cf userspace.tar target/release/roswapd target/release/roswapctl tools/blkcheck tools/memhold
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: userspace
+        path: userspace.tar
+        retention-days: 1
+
+  vm:
+    name: e2e on ${{ matrix.kernel }}
+    needs: userspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 最老的 LTS、Debian 12 用的 6.1、最新 LTS，再加最新 stable 提前发现新内核的问题。
+        kernel: [ "5.10", "6.1", "6.18", "stable" ]
+        include:
+          - kernel: "5.10"
+            cc: "gcc-11"
+          - kernel: "stable"
+            experimental: true
+    env:
+      CC: ${{ matrix.cc || 'gcc' }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # 内核树放在工作区外面，免得被 vng --rwdir 扫到。
+    # actions/cache 匹配路径时不处理 ".."，这里必须先展开成规范的绝对路径。
+    - name: Set kernel dir
+      run: echo "KDIR=$(dirname "$GITHUB_WORKSPACE")/linux-${{ matrix.kernel }}" >> "$GITHUB_ENV"
+
+    # 虚拟机直接用宿主机的根文件系统，测试要用的运行库也装在宿主机上。
+    - name: Install dependencies
+      run: |
+        bash .github/scripts/apt-install.sh \
+          build-essential "$CC" bc bison flex libelf-dev libssl-dev cpio rsync zstd python3-pip \
+          qemu-system-x86 virtiofsd udev kmod busybox-static \
+          ibverbs-providers librdmacm1
+        sudo pip3 install --break-system-packages virtme-ng==1.42
+        # Ubuntu 打过补丁的 Rust coreutils env 会拒绝通过 virtiofs 执行 guest init。
+        if [ -x /usr/bin/gnuenv ]; then sudo ln -sf gnuenv /usr/bin/env; fi
+
+    - name: Enable KVM
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+          sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        ls -l /dev/kvm
+
+    - name: Resolve kernel version
+      id: version
+      run: |
+        read -r version url < <(bash .github/scripts/kernel-tree.sh resolve "${{ matrix.kernel }}")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Restore kernel build
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ env.KDIR }}
+        key: vmkernel-${{ steps.version.outputs.version }}-${{ env.CC }}-${{ hashFiles('tests/e2e/kernel.config', '.github/scripts/kernel-tree.sh') }}
+
+    - name: Build kernel ${{ steps.version.outputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        KMAKE_ARGS="CC=$CC HOSTCC=$CC" \
+          bash .github/scripts/kernel-tree.sh build "${{ matrix.kernel }}" "$KDIR"
+        # cache/save 找不到路径时只打警告，先确认内核树确实在。
+        test -f "$KDIR/.roswap-built"
+        du -sh "$KDIR"
+
+    # 编完马上存，后面的测试失败也不用重新编内核。
+    - name: Save kernel build
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ env.KDIR }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: userspace
+
+    - name: Build roswap.ko
+      run: |
+        tar -xf userspace.tar
+        make -C kernel KDIR="$KDIR" CC="$CC" HOSTCC="$CC"
+
+    - name: Run e2e in VM
+      run: |
+        out="$GITHUB_WORKSPACE/e2e-logs"
+        mkdir -p "$out"
+        cd "$KDIR"
+        set +e
+        vng --verbose --disable-microvm --user root --cpus 2 --memory 3G \
+          --rwdir "$GITHUB_WORKSPACE" \
+          --exec "$GITHUB_WORKSPACE/tests/e2e/vm-run.sh $out" 2>&1 | tee "$out/console.txt"
+        vng_rc=${PIPESTATUS[0]}
+        set -e
+        cat "$out/summary.txt" 2>/dev/null || true
+        if [ ! -f "$out/result" ]; then
+          echo "::error::虚拟机没有运行到 vm-run.sh（vng 退出码 $vng_rc），内核控制台见上方或 console.txt"
+          exit 1
+        fi
+        test "$(cat "$out/result")" = 0
 
     - name: Upload logs
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: e2e-logs
+        name: e2e-logs-${{ matrix.kernel }}
         path: e2e-logs
         if-no-files-found: ignore
-
-    - name: Cleanup
-      if: always()
-      run: |
-        sudo swapoff /dev/roswap0 || true
-        sudo rmmod roswap || true
-        if [ -d /tmp/roswap-e2e ]; then
-          sudo kill $(cat /tmp/roswap-e2e/*.pid 2>/dev/null) || true
-        fi
-        sudo rdma link delete rxe0 || true
-        sudo ip link del roswap0 || true

@@ -3,51 +3,55 @@ name: roswap.ko
 on:
   push:
     branches: [ "master" ]
-    paths:
+    paths: &paths
       - 'kernel/**'
       - 'tests/e2e/kernel.config'
+      - '.checkpatch.conf'
       - '.github/workflows/kernel.yml'
       - '.github/scripts/apt-install.sh'
       - '.github/scripts/kernel-tree.sh'
   pull_request:
     branches: [ "master" ]
-    paths:
-      - 'kernel/**'
-      - 'tests/e2e/kernel.config'
-      - '.github/workflows/kernel.yml'
-      - '.github/scripts/apt-install.sh'
-      - '.github/scripts/kernel-tree.sh'
+    paths: *paths
   schedule:
-    # 每天 UTC 18:00 跑一次，新发布的 stable / rc 不用等代码改动就能发现问题。
+    # 新发布的 stable / rc 不用等代码改动就能发现问题。
     - cron: '0 18 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install kernel headers and build tools
+    - name: Checkpatch
       run: |
-        bash .github/scripts/apt-install.sh \
-          build-essential \
-          linux-headers-$(uname -r)
+        base=https://raw.githubusercontent.com/torvalds/linux/v6.18/scripts
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/checkpatch.pl" "$base/checkpatch.pl"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/spelling.txt" "$base/spelling.txt"
+        perl "$RUNNER_TEMP/checkpatch.pl" -f $(git ls-files 'kernel/*.[ch]' ':!kernel/map_user.h')
+
+    - name: Install kernel headers and build tools
+      run: bash .github/scripts/apt-install.sh build-essential linux-headers-$(uname -r)
 
     - name: Build kernel module
-      run: make -C kernel
+      run: make -C kernel KCFLAGS=-Werror
 
     - name: Map allocator tests
       run: make -C kernel map-test
 
   # 每个维护中的 LTS 分支、最新 stable 和 mainline rc 各编一次 roswap.ko。
-  # 只编译不运行，几分钟就能覆盖全部版本；运行时测试见 e2e-kernels.yml。
+  # 只编译不运行；运行时测试见 e2e.yml 的 vm job。
   compat:
     name: build on ${{ matrix.kernel }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # mainline 是还没发布的 rc，失败只作预警，不挡合并。
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false

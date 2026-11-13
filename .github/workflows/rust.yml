@@ -3,37 +3,48 @@ name: roswapd
 on:
   push:
     branches: [ "master" ]
+    paths: &paths
+      - 'src/**'
+      - 'proto/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/e2e/setup-rxe.sh'
+      - '.github/workflows/rust.yml'
+      - '.github/scripts/apt-install.sh'
+      - '.github/scripts/setup-soft-roce.sh'
   pull_request:
     branches: [ "master" ]
+    paths: *paths
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v4
 
+    - name: Format
+      run: cargo fmt --check
+
     - name: Install RDMA libraries
-      run: |
-        bash .github/scripts/apt-install.sh \
-          libibverbs-dev \
-          librdmacm-dev \
-          protobuf-compiler
+      run: bash .github/scripts/apt-install.sh libibverbs-dev librdmacm-dev protobuf-compiler
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Clippy
+      run: cargo clippy --locked --all-targets -- -D warnings
 
     - name: Setup Soft-RoCE
-      run: |
-        if ! modinfo rdma_rxe >/dev/null 2>&1; then
-          bash .github/scripts/apt-install.sh "linux-modules-extra-$(uname -r)"
-        fi
-        sudo modprobe rdma_rxe
-        sudo ip link add roswap0 type veth peer name roswap1
-        sudo ip link set roswap0 up
-        sudo ip link set roswap1 up
-        sudo ip addr add 192.168.88.1/24 dev roswap0
-        sudo rdma link add rxe0 type rxe netdev roswap0
+      run: bash .github/scripts/setup-soft-roce.sh
 
     - name: Run tests
-      run: cargo test -- --test-threads=1
+      run: cargo test --locked -- --test-threads=1
