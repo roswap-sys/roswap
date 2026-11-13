@@ -102,15 +102,26 @@ jobs:
         gcc -O2 -Wall -Wextra -o tools/blkcheck tools/blkcheck.c
         gcc -O2 -Wall -Wextra -o tools/memhold tools/memhold.c
 
+    # --disable-microvm：vng 在 KVM 下默认用 QEMU microvm 机型（virtio-mmio + 精简 ACPI），
+    # 老内核起不来。q35 + virtio-pci 所有版本都支持。
+    # --verbose 把内核控制台打出来，虚拟机没进到测试脚本时也能看到原因。
     - name: Run e2e in VM
       run: |
         out="$GITHUB_WORKSPACE/e2e-logs"
         rm -rf "$out" && mkdir -p "$out"
         cd "$KDIR"
-        vng --user root --cpus 2 --memory 3G --rwdir "$GITHUB_WORKSPACE" \
-          --exec "$GITHUB_WORKSPACE/tests/e2e/vm-run.sh $out" || true
+        set +e
+        vng --verbose --disable-microvm --user root --cpus 2 --memory 3G \
+          --rwdir "$GITHUB_WORKSPACE" \
+          --exec "$GITHUB_WORKSPACE/tests/e2e/vm-run.sh $out" 2>&1 | tee "$out/console.txt"
+        vng_rc=${PIPESTATUS[0]}
+        set -e
         cat "$out/summary.txt" 2>/dev/null || true
-        test "$(cat "$out/result" 2>/dev/null)" = 0
+        if [ ! -f "$out/result" ]; then
+          echo "::error::虚拟机没有运行到 vm-run.sh（vng 退出码 $vng_rc），内核控制台见上方或 console.txt"
+          exit 1
+        fi
+        test "$(cat "$out/result")" = 0
 
     - name: Upload logs
       if: always()
