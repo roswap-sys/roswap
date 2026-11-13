@@ -45,11 +45,12 @@ e2e_rdma_ip() {
 		return
 	fi
 	netdev=$(rdma link show | awk -v dev="$dev" '
-		index($0, dev "/") {
-			for (i = 1; i <= NF; i++) if ($i == "netdev") { print $(i + 1); exit }
-		}')
+		index($0, dev "/") && !nd {
+			for (i = 1; i <= NF; i++) if ($i == "netdev") nd = $(i + 1)
+		}
+		END { print nd }')
 	[[ -n $netdev ]] || die "rdma link show 里没有 $dev"
-	ip=$(ip -4 -o addr show dev "$netdev" | awk '{print $4; exit}')
+	ip=$(ip -4 -o addr show dev "$netdev" | awk 'NR == 1 { print $4 }')
 	ip=${ip%%/*}
 	[[ -n $ip ]] || die "$dev 的网卡 $netdev 没有 IPv4"
 	printf '%s\n' "$ip"
@@ -191,7 +192,13 @@ controller_ready() {
 		echo "controller 进程已退出，见 $E2E_LOG_DIR/controller.log" >&2
 		return 2
 	fi
-	ss -ltn | grep -q ":${E2E_CTRL_PORT} "
+	port_listening "$E2E_CTRL_PORT"
+}
+
+# 脚本开了 pipefail，不要写 "cmd | grep -q"：grep 提前退出时 cmd 会被 SIGPIPE 打断，
+# 整条管道按失败算。
+port_listening() {
+	[[ -n $(ss -Hltn "sport = :$1") ]]
 }
 
 start_provider() {
@@ -209,7 +216,7 @@ provider_ready() {
 		return 2
 	fi
 	grep -q "provider initialized" "$E2E_LOG_DIR/provider.log" || return 1
-	ss -ltn | grep -q ":${E2E_GRPC_PORT} "
+	port_listening "$E2E_GRPC_PORT"
 }
 
 load_module() {
@@ -227,7 +234,8 @@ kernel_ready() {
 	chunks=$(awk '{ for (i = 1; i <= NF; i++) if ($i == "chunks") print $(i + 1) }' <<<"$line")
 	links=$(awk '{ for (i = 1; i <= NF; i++) if ($i == "links_up") print $(i + 1) }' <<<"$line")
 	[[ ${chunks:-0} -ge 2 && ${links:-0} -ge 1 ]] || return 1
-	"$ROSWAPCTL" cluster "127.0.0.1:${E2E_CTRL_PORT}" 2>/dev/null | grep -q "synced true"
+	line=$("$ROSWAPCTL" cluster "127.0.0.1:${E2E_CTRL_PORT}" 2>/dev/null) || return 1
+	[[ $line == *"synced true"* ]]
 }
 
 wait_kernel() {
@@ -263,5 +271,5 @@ read_hash() {
 }
 
 cluster_rkey() {
-	"$ROSWAPCTL" cluster "127.0.0.1:${E2E_CTRL_PORT}" | awk '/^  chunk / { print $8; exit }'
+	"$ROSWAPCTL" cluster "127.0.0.1:${E2E_CTRL_PORT}" | awk '/^  chunk / && !rkey { rkey = $8 } END { print rkey }'
 }

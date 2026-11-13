@@ -150,7 +150,7 @@ scenario_fault() {
 }
 
 provider_port_free() {
-	! ss -ltn | grep -q ":${E2E_GRPC_PORT} "
+	! port_listening "$E2E_GRPC_PORT"
 }
 
 main() {
