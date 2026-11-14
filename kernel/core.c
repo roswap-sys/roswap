@@ -1108,8 +1108,14 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 	return rs_post_copies(rq, cmd, &copies, pick, ready, &bv, off, read, set);
 }
 
+/* 7.2 起最后一个参数从 unsigned int 改成 int。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+static int rs_init_request(struct blk_mq_tag_set *set, struct request *rq,
+			   unsigned int hctx_idx, int numa_node)
+#else
 static int rs_init_request(struct blk_mq_tag_set *set, struct request *rq,
 			   unsigned int hctx_idx, unsigned int numa_node)
+#endif
 {
 	struct roswap_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
@@ -1247,12 +1253,20 @@ static int rs_comp_vector(struct ib_device *dev, unsigned int cpu)
 
 	if (n <= 1)
 		return 0;
+	/*
+	 * 7.1 删掉了 ib_get_vector_affinity。拿不到亲和性时按 CPU 取模，
+	 * 完成中断仍然摊到不同的向量上。
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
 	for (v = 0; v < n; v++) {
 		const struct cpumask *mask = ib_get_vector_affinity(dev, v);
 
 		if (mask && cpumask_test_cpu(cpu, mask))
 			return v;
 	}
+#else
+	(void)v;
+#endif
 	return (int)(cpu % n);
 }
 

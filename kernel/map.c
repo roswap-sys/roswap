@@ -863,7 +863,15 @@ int rs_map_init(u32 capacity_mb)
 	}
 	m->counters = true;
 	spin_lock_init(&m->prot_lock);
+	/*
+	 * xa_alloc 只在标了 XA_FLAGS_ALLOC 的数组上合法。5.10 否则会
+	 * WARN 并返回 -EINVAL，chunk 加不进去。
+	 */
+#ifdef RS_MAP_TEST
 	xa_init(&m->chunks);
+#else
+	xa_init_flags(&m->chunks, XA_FLAGS_ALLOC);
+#endif
 	xa_init(&m->nodes);
 	rs_reserve_reset();
 	rs_map = m;
@@ -1018,10 +1026,13 @@ int rs_map_chunk_add(u16 node_id, u32 local_gid, u32 epoch, u64 raddr, u32 rkey,
 		return -ENOENT;
 	c = kzalloc(sizeof(*c), GFP_KERNEL);
 	key = kzalloc(sizeof(*key), GFP_KERNEL);
-	c->bm = c && key ? rs_bitmap(chunk_mb) : NULL;
-	if (!c || !key || !c->bm) {
-		if (c)
-			kfree(c->bm);
+	if (!c || !key) {
+		kfree(key);
+		kfree(c);
+		return -ENOMEM;
+	}
+	c->bm = rs_bitmap(chunk_mb);
+	if (!c->bm) {
 		kfree(key);
 		kfree(c);
 		return -ENOMEM;
