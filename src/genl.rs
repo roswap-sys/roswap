@@ -119,8 +119,16 @@ impl GenlClient {
         })
     }
 
-    pub fn chunk_update(&mut self, gid: u32, epoch: u32, raddr: u64, rkey: u32) -> io::Result<()> {
+    pub fn chunk_update(
+        &mut self,
+        node_id: u16,
+        gid: u32,
+        epoch: u32,
+        raddr: u64,
+        rkey: u32,
+    ) -> io::Result<()> {
         self.command(RS_CMD_CHUNK_UPDATE, |msg| {
+            msg.put_u16(RS_A_NODE_ID, node_id);
             msg.put_u32(RS_A_CHUNK_GID, gid);
             msg.put_u32(RS_A_EPOCH, epoch);
             msg.put_u64(RS_A_RADDR, raddr);
@@ -438,8 +446,9 @@ mod tests {
     }
 
     #[test]
-    fn chunk_update_omits_the_node_and_the_size() {
+    fn chunk_update_names_the_node_and_omits_the_size() {
         let mut msg = Msg::new(9, NLM_F_REQUEST, 1, RS_CMD_CHUNK_UPDATE);
+        msg.put_u16(RS_A_NODE_ID, 2);
         msg.put_u32(RS_A_CHUNK_GID, 4);
         msg.put_u32(RS_A_EPOCH, 8);
         msg.put_u64(RS_A_RADDR, 0x1000);
@@ -447,7 +456,7 @@ mod tests {
         msg.finish();
         let attrs = parse_attrs(payload(&msg));
         assert_eq!(msg.buf[16], RS_CMD_CHUNK_UPDATE);
-        assert!(attr_u16(&attrs, RS_A_NODE_ID).is_err());
+        assert_eq!(attr_u16(&attrs, RS_A_NODE_ID).unwrap(), 2);
         assert!(attr_u32(&attrs, RS_A_CHUNK_MB).is_err());
         assert_eq!(attr_u32(&attrs, RS_A_RKEY).unwrap(), 99);
     }

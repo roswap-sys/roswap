@@ -22,16 +22,20 @@
 #define ROSWAP_FAULT_POLL_US	20
 /* 4.096us * 2^14 ≈ 67ms。retry_count 4 时在途请求大约 335ms 报错。 */
 #define ROSWAP_ACK_TIMEOUT	14
+/* 第一份读超过这个时间还没回来，就向另一份副本再发一次。 */
+#define ROSWAP_HEDGE_US		1500
 
 enum rs_link_state {
 	RS_LINK_OFF = 0,
 	RS_LINK_UP = 1,
 	RS_LINK_RECOVERING = 2,
+	RS_LINK_KEY_WAIT = 3,
+	RS_LINK_FATAL = 4,
 };
 
 /*
  * Generic Netlink "roswap"。数字是用户态 ABI，改之前要一起改 src/genl.rs。
- * NODE_ADD 只登记地址；CHUNK_ADD / CHUNK_UPDATE 把 raddr、rkey 交进来。
+ * NODE_ADD 只登记地址。CHUNK_ADD / CHUNK_UPDATE 以 (node_id, 本地 gid) 为键。
  */
 enum rs_genl_cmd {
 	RS_CMD_UNSPEC,
@@ -81,7 +85,8 @@ static_assert(sizeof(struct rs_conn_pdata) == 48);
 int roswap_node_add(u16 node_id, const char *server);
 int roswap_chunk_add(u16 node_id, u32 gid, u32 epoch, u64 raddr, u32 rkey,
 		     u32 chunk_mb);
-int roswap_chunk_update(u32 gid, u32 epoch, u64 raddr, u32 rkey);
+int roswap_chunk_update(u16 node_id, u32 local_gid, u32 epoch, u64 raddr,
+		      u32 rkey);
 int roswap_links_up(void);
 int rs_genl_register(void);
 void rs_genl_unregister(void);

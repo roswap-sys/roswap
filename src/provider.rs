@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::chunk::{Chunk, HeartbeatPage};
 use crate::rdma::{
-    chunk_size_error, cm_event_drops_connection, rdma_dev_ipv4, snapshot_cm_event,
-    sockaddr_from_v4, CmEventView, ConnPrivateData, PassiveConnection, RdmaDeviceContext,
+    admit_passive_qp, chunk_size_error, cm_event_drops_connection, device_max_qp, rdma_dev_ipv4,
+    snapshot_cm_event, sockaddr_from_v4, CmEventView, ConnPrivateData, PassiveConnection,
+    RdmaDeviceContext,
 };
 use crate::sys;
 use log::{debug, info, warn};
@@ -98,7 +99,11 @@ pub struct ProviderRuntime {
     channel: NonNull<sys::rdma_event_channel>,
     listen_id: NonNull<sys::rdma_cm_id>,
     conns: HashMap<usize, PassiveConnection>,
+    max_qp: i32,
 }
+
+const PASSIVE_LISTEN_BACKLOG: i32 = 1024;
+const PASSIVE_WR_DEPTH: u32 = 1;
 
 unsafe impl Send for ProviderRuntime {}
 
@@ -169,7 +174,7 @@ impl ProviderRuntime {
             return Err(err);
         }
 
-        let rc = unsafe { sys::rdma_listen(listen_id.as_ptr(), 128) };
+        let rc = unsafe { sys::rdma_listen(listen_id.as_ptr(), PASSIVE_LISTEN_BACKLOG) };
         if rc != 0 {
             let err = io::Error::last_os_error();
             unsafe {
@@ -194,6 +199,16 @@ impl ProviderRuntime {
             ));
         }
 
+        let max_qp = match device_max_qp(rdma.context().as_ptr()) {
+            Ok(n) => n,
+            Err(err) => {
+                unsafe {
+                    let _ = sys::rdma_destroy_id(listen_id.as_ptr());
+                    sys::rdma_destroy_event_channel(channel.as_ptr());
+                }
+                return Err(err);
+            }
+        };
         let mut config = config.clone();
         config.listen_addr = listen_addr;
         Ok(Self {
@@ -204,6 +219,7 @@ impl ProviderRuntime {
             channel,
             listen_id,
             conns: HashMap::new(),
+            max_qp,
         })
     }
 
@@ -348,6 +364,19 @@ impl ProviderRuntime {
         }
         let cpu = pdata.cpu();
         let node_id = pdata.node_id();
+        let replaced = self.conns.iter().find_map(|(key, conn)| {
+            if conn.node_id == node_id && conn.cpu == cpu && conn.purpose == purpose {
+                Some(*key)
+            } else {
+                None
+            }
+        });
+        if !admit_passive_qp(self.conns.len(), self.max_qp, replaced.is_some()) {
+            return Err(format!("rdma device QP limit {} reached", self.max_qp));
+        }
+        if let Some(key) = replaced {
+            self.drop_connection(key);
+        }
 
         let id_verbs = unsafe { (*client_id.as_ptr()).verbs };
         let pd_ctx = unsafe { (*self.rdma.pd().as_ptr()).context };
@@ -364,8 +393,8 @@ impl ProviderRuntime {
             recv_cq: self.rdma.shared_cq().as_ptr(),
             srq: std::ptr::null_mut(),
             cap: sys::ibv_qp_cap {
-                max_send_wr: 16,
-                max_recv_wr: 16,
+                max_send_wr: PASSIVE_WR_DEPTH,
+                max_recv_wr: PASSIVE_WR_DEPTH,
                 max_send_sge: 1,
                 max_recv_sge: 1,
                 max_inline_data: 0,

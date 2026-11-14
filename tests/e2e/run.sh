@@ -149,6 +149,60 @@ scenario_fault() {
 	say "fault 通过"
 }
 
+scenario_params() {
+	local ko=$ROOT/kernel/roswap.ko
+	modprobe -q rdma_cm 2>/dev/null || true
+	say "非法地址"
+	if insmod "$ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB" local_addrs=not-an-ip \
+		>"$E2E_LOG_DIR/bad-ip.txt" 2>&1; then
+		rmmod roswap || true
+		die "非法 local_addrs 被接受了"
+	fi
+	say "没有对应网卡的地址"
+	if insmod "$ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB" local_addrs=192.0.2.1 \
+		>"$E2E_LOG_DIR/missing-ip.txt" 2>&1; then
+		rmmod roswap || true
+		die "不存在的网卡地址被接受了"
+	fi
+	say "超过 16TiB 的逻辑盘"
+	if insmod "$ko" chunk_size_mb="$CHUNK_MB" capacity_mb=$(( (16 << 20) + 1 )) \
+		>"$E2E_LOG_DIR/huge-cap.txt" 2>&1; then
+		rmmod roswap || true
+		die "16TiB 以上的 capacity_mb 被接受了"
+	fi
+	say "不写 local_addrs"
+	insmod "$ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB"
+	[[ -b /dev/roswap0 ]] || die "默认参数没有建出 /dev/roswap0"
+	rmmod roswap
+	say "params 通过"
+}
+
+scenario_stress() {
+	local expect got
+	bring_up
+	say "反复断连时继续读"
+	expect=$(write_pattern)
+	start_io_loop
+	sleep 0.2
+	local i
+	for i in 1 2 3 4; do
+		echo 1 >/sys/module/roswap/parameters/drop_connection
+		sleep 0.4
+	done
+	sleep 2
+	stop_io_loop
+	[[ ! -f $E2E_LOG_DIR/io.fail ]] || die "反复断连期间 IO 失败"
+	if dmesg | grep -q "possible circular locking dependency"; then
+		die "lockdep 报告了锁顺序问题"
+	fi
+	if dmesg | grep -q "BUG: sleeping function called from invalid context"; then
+		die "原子上下文里睡眠"
+	fi
+	got=$(read_hash)
+	[[ $expect == "$got" ]] || die "反复断连后读回内容不一致"
+	say "stress 通过"
+}
+
 provider_port_free() {
 	! port_listening "$E2E_GRPC_PORT"
 }
@@ -156,9 +210,9 @@ provider_port_free() {
 main() {
 	local scenario=${1:-}
 	case $scenario in
-	blk | swap | fault) ;;
+	blk | swap | fault | params | stress) ;;
 	*)
-		echo "用法: $0 blk|swap|fault" >&2
+		echo "用法: $0 blk|swap|fault|params|stress" >&2
 		exit 2
 		;;
 	esac

@@ -24,11 +24,14 @@ all:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
 map-test:
-	gcc -std=c11 -Wall -Wextra -Werror -DRS_MAP_TEST -I$(CURDIR) \
+	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
 		$(CURDIR)/map_test.c -o /tmp/roswap-map-test
 	/tmp/roswap-map-test
+	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
+		$(CURDIR)/hedge_race_test.c -o /tmp/roswap-hedge-race
+	/tmp/roswap-hedge-race
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
-	rm -f /tmp/roswap-map-test
+	rm -f /tmp/roswap-map-test /tmp/roswap-hedge-race
 endif

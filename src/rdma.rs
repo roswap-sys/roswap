@@ -99,6 +99,43 @@ impl ConnPrivateData {
     }
 }
 
+/// `offsetof(ibv_device_attr, max_qp)`。结构体 232 字节，这里只读这一个字段。
+const DEVICE_ATTR_MAX_QP: usize = 108;
+const DEVICE_ATTR_BYTES: usize = 232;
+
+pub fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
+    let mut buf = vec![0u8; DEVICE_ATTR_BYTES];
+    let rc = unsafe { sys::ibv_query_device(ctx, buf.as_mut_ptr() as *mut std::ffi::c_void) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let max_qp = i32::from_ne_bytes(
+        buf[DEVICE_ATTR_MAX_QP..DEVICE_ATTR_MAX_QP + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if max_qp <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ibv_query_device returned no QP capacity",
+        ));
+    }
+    Ok(max_qp)
+}
+
+/// 替换同一条通道时不额外占 QP。满了就拒绝新连接。
+pub fn admit_passive_qp(active: usize, max_qp: i32, replacing: bool) -> bool {
+    if max_qp <= 0 {
+        return false;
+    }
+    let used = if replacing && active > 0 {
+        active - 1
+    } else {
+        active
+    };
+    used < max_qp as usize
+}
+
 pub fn chunk_size_error(advertised_mb: u32, chunk_bytes: usize) -> Option<&'static str> {
     if advertised_mb == 0 {
         return Some("client did not advertise chunk_size_mb");
@@ -480,5 +517,14 @@ mod tests {
         assert!(!cm_event_drops_connection(
             sys::RDMA_CM_EVENT_CONNECT_REQUEST
         ));
+    }
+
+    #[test]
+    fn replacing_a_channel_does_not_consume_another_qp() {
+        assert!(admit_passive_qp(10, 10, true));
+        assert!(!admit_passive_qp(10, 10, false));
+        assert!(admit_passive_qp(9, 10, false));
+        assert!(!admit_passive_qp(0, 0, true));
+        assert!(!admit_passive_qp(1, -1, true));
     }
 }

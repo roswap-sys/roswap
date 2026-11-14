@@ -67,6 +67,12 @@ jobs:
     - name: Fault injection
       run: sudo tests/e2e/run.sh fault
 
+    - name: Module parameters
+      run: sudo tests/e2e/run.sh params
+
+    - name: Reconnect under IO
+      run: sudo tests/e2e/run.sh stress
+
     - name: Collect logs
       if: failure()
       run: |

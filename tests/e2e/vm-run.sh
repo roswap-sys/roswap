@@ -11,7 +11,7 @@ E2E_OUT=${1:?用法: $0 <输出目录> [场景...]}
 shift
 scenarios=("$@")
 if [[ ${#scenarios[@]} -eq 0 ]]; then
-	scenarios=(blk swap fault)
+	scenarios=(blk swap fault params stress)
 fi
 
 mkdir -p "$E2E_OUT"

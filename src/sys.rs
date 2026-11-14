@@ -408,6 +408,7 @@ extern "C" {
     pub fn ibv_free_device_list(list: *mut *mut ibv_device);
     pub fn ibv_get_device_name(device: *mut ibv_device) -> *const c_char;
     pub fn ibv_open_device(device: *mut ibv_device) -> *mut ibv_context;
+    pub fn ibv_query_device(context: *mut ibv_context, device_attr: *mut c_void) -> c_int;
     pub fn ibv_close_device(context: *mut ibv_context) -> c_int;
     pub fn ibv_alloc_pd(context: *mut ibv_context) -> *mut ibv_pd;
     pub fn ibv_dealloc_pd(pd: *mut ibv_pd) -> c_int;

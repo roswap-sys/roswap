@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "map.c"
 
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int failures;
+
+static void on_alarm(int sig)
+{
+	(void)sig;
+	fprintf(stderr, "FAIL map race timed out\n");
+	_exit(2);
+}
 
 static void expect(int cond, const char *what)
 {
@@ -64,6 +74,81 @@ static void test_copy_word(void)
 
 	expect(rs_copy_note(0x15, 2, true) == 0x15, "which 2 is ignored");
 	expect(rs_copy_note(0x15, 99, false) == 0x15, "a large which is ignored");
+}
+
+static void test_hedge_word(void)
+{
+	u32 w, out;
+
+	expect(rs_copy_mark_sent(0x15, 2) == 0x15, "mark sent ignores which 2");
+	w = rs_copy_mark_sent(0, 0);
+	expect(rs_copy_sent_mask(w) == 0x1, "copy 0 is sent");
+	w = rs_copy_note(w, 0, true);
+	expect(rs_copy_sent_mask(w) == 0x1, "arrival keeps the sent bit");
+	expect(rs_copy_ok(w) == 0x1, "arrival records success");
+	expect(!rs_hedge_should_post(w, 1, true), "arrived primary is not hedged");
+	expect(rs_copy_flush_which(w) == -1, "a single success has nothing to flush");
+	expect(rs_copy_claim_finish(w, &out) && (out & RS_COPY_FINISH),
+	       "one sent copy can finish");
+	expect(!rs_copy_claim_finish(out, &out), "finish is claimed once");
+
+	w = rs_copy_mark_sent(0, 0);
+	expect(!rs_hedge_should_post(w, 1, false), "hedge waits for the deadline");
+	expect(rs_hedge_should_post(w, 1, true), "overdue primary can hedge");
+	expect(!rs_hedge_should_post(w, 0, true), "the sent copy is not the hedge");
+	expect(!rs_hedge_should_post(w, 2, true), "which 2 is not a hedge");
+	w = rs_copy_mark_sent(w, 1);
+	expect(!rs_hedge_should_post(w, 1, true), "hedge is posted once");
+	expect(rs_copy_flush_which(w) == -1, "no success yet, do not flush");
+	expect(!rs_copy_claim_finish(w, &out), "a pending hedge blocks finish");
+
+	w = rs_copy_note(w, 0, true);
+	expect(rs_copy_flush_which(w) == 1, "flush the outstanding hedge");
+	expect(!rs_copy_claim_finish(w, &out), "hedge arrival is still required");
+	w = rs_copy_note(w, 1, false);
+	expect(rs_copy_ok(w) == 0x1, "flush failure keeps the good copy");
+	expect(rs_copy_flush_which(w) == -1, "both arrivals clear the flush");
+	expect(rs_copy_claim_finish(w, &out), "both arrivals can finish");
+	expect(!rs_hedge_should_post(out, 1, true), "a finished word is closed");
+
+	w = rs_copy_mark_sent(rs_copy_mark_sent(0, 0), 1);
+	w = rs_copy_note(w, 1, true);
+	expect(rs_copy_flush_which(w) == 0, "flush the outstanding primary");
+	expect(!rs_copy_claim_finish(0, &out), "nothing sent cannot finish");
+	expect(!rs_copy_claim_finish(w, NULL), "claim needs an output");
+}
+
+static void test_read_arrive(void)
+{
+	u32 w, out;
+	int act;
+
+	w = rs_copy_mark_sent(rs_copy_mark_sent(0, 0), 1);
+	act = rs_read_arrive(w, 0, true, &out);
+	expect(act == RS_ACT_PUBLISH && (out & RS_COPY_FINISH),
+	       "first success publishes");
+	expect(rs_copy_ok(out) == 0x1, "publish records copy 0");
+	act = rs_read_arrive(out, 1, true, &out);
+	expect(act == RS_ACT_WAIT && rs_copy_ok(out) == 0x1,
+	       "a finished word ignores the late copy");
+
+	w = rs_copy_mark_sent(rs_copy_mark_sent(0, 0), 1);
+	act = rs_read_arrive(w, 0, false, &out);
+	expect(act == RS_ACT_WAIT, "one failure still waits");
+	act = rs_read_arrive(out, 1, false, &out);
+	expect(act == RS_ACT_FAIL && (out & RS_COPY_FINISH),
+	       "both failures finish the read");
+	expect(rs_copy_ok(out) == 0, "fail publish has no data");
+
+	w = rs_copy_mark_sent(0, 0);
+	act = rs_read_arrive(w, 0, true, &out);
+	expect(act == RS_ACT_PUBLISH, "the only copy publishes");
+	act = rs_read_arrive(w, 0, true, &out);
+	expect(act == RS_ACT_PUBLISH, "same input publishes again");
+	act = rs_read_arrive(out, 0, false, &out);
+	expect(act == RS_ACT_WAIT, "duplicate arrival does not fail a publish");
+	expect(rs_read_arrive(w, 2, true, &out) == RS_ACT_WAIT, "which 2 is ignored");
+	expect(out == w, "ignored which leaves the word");
 }
 
 static void test_same_extent_and_discard(void)
@@ -157,9 +242,9 @@ static void test_key_update_and_sizes(void)
 
 	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "write");
 	gen = remote.r[0].gen;
-	expect(rs_map_chunk_update(0, 1, 0x1000, 1) == 0, "same key");
+	expect(rs_map_chunk_update(4, 0, 1, 0x1000, 1) == 0, "same key");
 	expect(rs_map_chunk_gen(0) == gen, "gen stable");
-	expect(rs_map_chunk_update(0, 9, 0x5555, 77) == 1, "new key");
+	expect(rs_map_chunk_update(4, 0, 9, 0x5555, 77) == 1, "new key");
 	expect(rs_map_chunk_gen(0) != gen, "gen bumped");
 	commit(0, &remote);
 	expect(rs_map_lookup_read(0, 4096, &remote) == 0, "read new key");
@@ -169,7 +254,7 @@ static void test_key_update_and_sizes(void)
 	       "updated base");
 	expect(remote.r[0].gen == rs_map_chunk_gen(0), "gen matches");
 	rs_map_finish(0);
-	expect(rs_map_chunk_update(9, 1, 1, 1) == -ENOENT, "unknown chunk");
+	expect(rs_map_chunk_update(4, 9, 1, 1, 1) == -ENOENT, "unknown chunk");
 	expect(rs_map_prepare_write(0, 512, &remote) == -EINVAL, "short write");
 	expect(rs_map_lookup_read(1ULL << 20, 4096, &remote) == -EINVAL, "past end");
 }
@@ -188,10 +273,14 @@ static void test_edges(void)
 
 	rs_map_exit();
 	expect(rs_map_init(0) == -EINVAL, "reject zero capacity");
-	expect(rs_map_init((1u << 20) + 1) == -EINVAL, "reject above 1TiB");
+	expect(rs_capacity_ok(0) == -EINVAL, "reject zero capacity");
+	expect(rs_capacity_ok((16u << 20) + 1) == -EINVAL, "reject above 16TiB");
+	expect(rs_capacity_ok(16u << 20) == -EINVAL, "16TiB does not fit in a page number");
+	expect(rs_capacity_ok(RS_MAX_CAPACITY_MB) == 0, "largest fitting capacity");
+	expect(rs_capacity_ok(1u << 20) == 0, "1TiB fits");
 	expect(rs_map_node_add(1) == -ENODEV, "node before init");
 	expect(rs_map_chunk_add(1, 0, 1, 1, 1, 1) == -ENODEV, "chunk before init");
-	expect(rs_map_chunk_update(0, 1, 1, 1) == -ENODEV, "update before init");
+	expect(rs_map_chunk_update(0, 0, 1, 1, 1) == -ENODEV, "update before init");
 	expect(rs_map_prepare_write(0, 4096, &remote) == -EINVAL, "write before init");
 	expect(rs_map_lookup_read(0, 4096, &remote) == -EINVAL, "read before init");
 	expect(rs_map_discard(0, 4096) == -EINVAL, "discard before init");
@@ -209,10 +298,14 @@ static void test_edges(void)
 	expect(st.nr_nodes == 1 && st.nr_chunks == 0, "node without chunk");
 	expect(st.degraded_slots == 0, "nothing degraded yet");
 	expect(rs_map_chunk_add(9, 0, 1, base, 1, 1) == -ENOENT, "chunk needs a node");
-	expect(rs_map_chunk_add(1, 64, 1, base, 1, 1) == -EINVAL, "gid 64");
-	expect(rs_map_chunk_add(1, 63, 1, base, 1, 1) == 0, "gid 63");
-	expect(rs_map_chunk_node(63, &node) == 0 && node == 1, "chunk node");
-	expect(rs_map_chunk_node(0, &node) == -ENOENT, "missing chunk node");
+	expect(rs_map_chunk_add(1, 64, 1, base, 1, 1) == 0, "local gid 64");
+	{
+		u32 global = 0;
+
+		expect(rs_map_chunk_find(1, 64, &global) == 0, "find local gid 64");
+		expect(rs_map_chunk_node(global, &node) == 0 && node == 1, "chunk node");
+	}
+	expect(rs_map_chunk_node(99, &node) == -ENOENT, "missing chunk node");
 	expect(rs_map_chunk_node(63, NULL) == -EINVAL, "null node out");
 	expect(rs_map_node_add(1) == 0, "idempotent node");
 	expect(rs_map_lookup_read(0, 4096, &remote) == RS_MAP_ZERO, "read allocates nothing");
@@ -331,18 +424,18 @@ static void test_limits_and_placement(void)
 	commit(1ull << 20, &remote);
 
 	reset_map(1);
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < RS_MAX_NODES; i++)
 		expect(rs_map_node_add((u16)i) == 0, "fill the node table");
-	expect(rs_map_node_add(16) == -ENOSPC, "17th node is rejected");
+	expect(rs_map_node_add(RS_MAX_NODES) == -ENOSPC, "one past the node table");
 	expect(rs_map_node_add(0) == 0, "an existing node can be added again");
 
 	reset_map(1);
 	expect(rs_map_node_add(4) == 0, "node");
 	expect(rs_map_chunk_add(4, 0, 1, base, 1, 1) == 0, "chunk");
 	rs_map_test_set_gen(0, 0xffffffffu);
-	expect(rs_map_chunk_update(0, 1, base, 1) == 0, "same identity does not bump gen");
+	expect(rs_map_chunk_update(4, 0, 1, base, 1) == 0, "same identity does not bump gen");
 	expect(rs_map_chunk_gen(0) == 0xffffffffu, "gen stays at the top");
-	expect(rs_map_chunk_update(0, 2, base, 1) == 1, "epoch change wraps gen");
+	expect(rs_map_chunk_update(4, 0, 2, base, 1) == 1, "epoch change wraps gen");
 	expect(rs_map_chunk_gen(0) == 1, "gen skips zero");
 }
 
@@ -437,15 +530,132 @@ static void test_replica2(void)
 	expect(st.used_slots == 0 && st.degraded_slots == 0, "a bad offset changes nothing");
 }
 
+static void test_same_local_gid(void)
+{
+	struct rs_copies remote;
+	u32 g0 = 0, g1 = 0, gen0;
+
+	reset_map(2);
+	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "two nodes");
+	expect(rs_map_chunk_add(1, 0, 1, 0x1000, 11, 1) == 0, "node 1 local 0");
+	expect(rs_map_chunk_add(2, 0, 1, 0x8000, 22, 1) == 0, "node 2 local 0");
+	expect(rs_map_chunk_find(1, 0, &g0) == 0, "find node 1");
+	expect(rs_map_chunk_find(2, 0, &g1) == 0, "find node 2");
+	expect(g0 != g1, "the same local gid gets two global ids");
+	gen0 = rs_map_chunk_gen(g0);
+	expect(rs_map_chunk_update(2, 0, 9, 0x9000, 77) == 1, "update node 2");
+	expect(rs_map_chunk_gen(g0) == gen0, "node 1 keeps its generation");
+	expect(rs_map_chunk_gen(g1) != gen0, "node 2 generation moved");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "place");
+	commit(0, &remote);
+	expect(rs_map_lookup_read(0, 4096, &remote) == 0, "read");
+	if (remote.r[0].node_id == 2) {
+		expect(remote.r[0].rkey == 77, "updated rkey is node 2");
+		expect(remote.r[0].addr == 0x9000, "updated base is node 2");
+	} else {
+		expect(remote.r[0].rkey == 11, "node 1 rkey was not rewritten");
+		expect(remote.r[0].addr == 0x1000, "node 1 base was not rewritten");
+	}
+	rs_map_finish(0);
+	expect(rs_map_chunk_find(3, 0, &g0) == -ENOENT, "missing node");
+	expect(rs_map_chunk_find(1, 0, NULL) == -EINVAL, "null global out");
+}
+
+static void test_steal_reserve(void)
+{
+	struct rs_copies remote;
+	const u64 base = 0x500000000ULL;
+
+	rs_map_test_set_cpu(0);
+	reset_map(16);
+	expect(rs_map_node_add(1) == 0, "node");
+	expect(rs_map_chunk_add(1, 0, 1, base, 5, 8) == 0, "eight extents");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "cpu 0 takes one");
+	rs_map_test_set_cpu(1);
+	expect(rs_map_prepare_write(1ull << 20, 4096, &remote) == 0,
+	       "cpu 1 steals a reserved extent");
+	expect(remote.r[0].addr != base + (7ull << 20), "the stolen extent is not cpu 0's");
+	commit(0, &remote);
+	commit(1ull << 20, &remote);
+	rs_map_test_set_cpu(0);
+}
+
+struct rs_race_job {
+	int cpu;
+	u32 base;
+	u32 n;
+	int fail;
+};
+
+static void *rs_race_worker(void *arg)
+{
+	struct rs_race_job *job = arg;
+	u32 i;
+
+	rs_map_test_set_cpu(job->cpu);
+	for (i = 0; i < job->n; i++) {
+		struct rs_copies remote;
+		u64 off = ((u64)job->base + i) << 20;
+
+		if (rs_map_prepare_write(off, 4096, &remote))
+			job->fail = 1;
+		else
+			rs_map_finish_write(off, remote.mask);
+		if (rs_map_lookup_read(off, 4096, &remote))
+			job->fail = 1;
+		else
+			rs_map_finish(off);
+		if (rs_map_discard(off, 4096))
+			job->fail = 1;
+	}
+	return NULL;
+}
+
+static void test_concurrent_map(void)
+{
+	struct rs_race_job jobs[4];
+	pthread_t threads[4];
+	struct rs_map_stats st;
+	int i;
+
+	if (signal(SIGALRM, on_alarm) == SIG_ERR)
+		expect(0, "alarm");
+	reset_map(32);
+	expect(rs_map_node_add(1) == 0, "node");
+	expect(rs_map_chunk_add(1, 0, 1, 0x600000000ULL, 3, 32) == 0, "chunk");
+	alarm(5);
+	for (i = 0; i < 4; i++) {
+		jobs[i].cpu = i;
+		jobs[i].base = (u32)i * 8;
+		jobs[i].n = 8;
+		jobs[i].fail = 0;
+		expect(pthread_create(&threads[i], NULL, rs_race_worker, &jobs[i]) == 0,
+		       "start map racer");
+	}
+	for (i = 0; i < 4; i++) {
+		expect(pthread_join(threads[i], NULL) == 0, "join map racer");
+		expect(!jobs[i].fail, "racer io");
+	}
+	alarm(0);
+	rs_map_stats(&st);
+	expect(st.used_slots == 0 && st.free_extents == 32, "racers returned every extent");
+	rs_map_test_set_cpu(0);
+}
+
 int main(void)
 {
 	test_copy_word();
+	test_hedge_word();
+	test_read_arrive();
 	test_same_extent_and_discard();
 	test_power_of_two();
 	test_key_update_and_sizes();
 	test_edges();
 	test_limits_and_placement();
 	test_replica2();
+	test_same_local_gid();
+	test_steal_reserve();
+	test_concurrent_map();
 	rs_map_exit();
 	if (failures) {
 		fprintf(stderr, "%d failures\n", failures);

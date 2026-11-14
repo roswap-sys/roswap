@@ -72,11 +72,13 @@ static int rs_cmd_chunk_update(struct sk_buff *skb, struct genl_info *info)
 	int ret;
 
 	(void)skb;
-	ret = rs_need(info, RS_A_CHUNK_GID) ?: rs_need(info, RS_A_EPOCH) ?:
-	      rs_need(info, RS_A_RADDR) ?: rs_need(info, RS_A_RKEY);
+	ret = rs_need(info, RS_A_NODE_ID) ?: rs_need(info, RS_A_CHUNK_GID) ?:
+	      rs_need(info, RS_A_EPOCH) ?: rs_need(info, RS_A_RADDR) ?:
+	      rs_need(info, RS_A_RKEY);
 	if (ret)
 		return ret;
-	return roswap_chunk_update(nla_get_u32(info->attrs[RS_A_CHUNK_GID]),
+	return roswap_chunk_update(nla_get_u16(info->attrs[RS_A_NODE_ID]),
+				   nla_get_u32(info->attrs[RS_A_CHUNK_GID]),
 				   nla_get_u32(info->attrs[RS_A_EPOCH]),
 				   nla_get_u64(info->attrs[RS_A_RADDR]),
 				   nla_get_u32(info->attrs[RS_A_RKEY]));

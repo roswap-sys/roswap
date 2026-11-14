@@ -39,6 +39,7 @@ pub enum KernelOp {
         size_mb: u32,
     },
     ChunkUpdate {
+        node_id: u16,
         gid: u32,
         epoch: u32,
         raddr: u64,
@@ -97,6 +98,7 @@ impl Registry {
                 match &state.kernel {
                     Some(installed) if installed == &state.desired => {}
                     Some(_) => ops.push(KernelOp::ChunkUpdate {
+                        node_id: *node_id,
                         gid: state.desired.gid,
                         epoch: state.desired.epoch,
                         raddr: state.desired.raddr,
@@ -146,22 +148,25 @@ impl Registry {
                 }
             }
             KernelOp::ChunkUpdate {
+                node_id,
                 gid,
                 epoch,
                 raddr,
                 rkey,
             } => {
-                for node in self.nodes.values_mut() {
-                    if let Some(state) = node.chunks.get_mut(gid) {
-                        let size_mb = state.desired.size_mb;
-                        state.kernel = Some(ChunkReport {
-                            gid: *gid,
-                            epoch: *epoch,
-                            raddr: *raddr,
-                            rkey: *rkey,
-                            size_mb,
-                        });
-                    }
+                if let Some(state) = self
+                    .nodes
+                    .get_mut(node_id)
+                    .and_then(|node| node.chunks.get_mut(gid))
+                {
+                    let size_mb = state.desired.size_mb;
+                    state.kernel = Some(ChunkReport {
+                        gid: *gid,
+                        epoch: *epoch,
+                        raddr: *raddr,
+                        rkey: *rkey,
+                        size_mb,
+                    });
                 }
             }
         }
@@ -250,15 +255,19 @@ impl Controller {
                         if !is_already_exists(&err) {
                             return Err(err);
                         }
-                        self.genl.chunk_update(*gid, *epoch, *raddr, *rkey)?;
+                        self.genl
+                            .chunk_update(*node_id, *gid, *epoch, *raddr, *rkey)?;
                     }
                 }
                 KernelOp::ChunkUpdate {
+                    node_id,
                     gid,
                     epoch,
                     raddr,
                     rkey,
-                } => self.genl.chunk_update(*gid, *epoch, *raddr, *rkey)?,
+                } => self
+                    .genl
+                    .chunk_update(*node_id, *gid, *epoch, *raddr, *rkey)?,
             }
             self.registry.commit(&op);
         }
@@ -418,12 +427,37 @@ mod tests {
         assert_eq!(
             registry.pending(),
             vec![KernelOp::ChunkUpdate {
+                node_id: 2,
                 gid: 0,
                 epoch: 3,
                 raddr: 0x1000,
                 rkey: 10,
             }]
         );
+    }
+
+    #[test]
+    fn chunk_update_does_not_touch_another_nodes_same_gid() {
+        let mut registry = Registry::default();
+        registry.upsert(2, 3, "10.0.0.2:18515", &[chunk(0, 9)]);
+        registry.upsert(5, 3, "10.0.0.5:18515", &[chunk(0, 4)]);
+        commit_all(&mut registry);
+        registry.upsert(2, 3, "10.0.0.2:18515", &[chunk(0, 11)]);
+        assert_eq!(
+            registry.pending(),
+            vec![KernelOp::ChunkUpdate {
+                node_id: 2,
+                gid: 0,
+                epoch: 3,
+                raddr: 0x1000,
+                rkey: 11,
+            }]
+        );
+        commit_all(&mut registry);
+        let views = registry.views();
+        assert_eq!(views[0].chunks[0].rkey, 11);
+        assert_eq!(views[1].chunks[0].rkey, 4);
+        assert!(views[0].kernel_synced && views[1].kernel_synced);
     }
 
     #[test]
@@ -504,6 +538,7 @@ mod tests {
         assert_eq!(
             registry.pending(),
             vec![KernelOp::ChunkUpdate {
+                node_id: 2,
                 gid: 0,
                 epoch: 3,
                 raddr: 0x1000,
