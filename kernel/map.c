@@ -6,7 +6,6 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
-#include <linux/lockdep.h>
 #include <linux/mm.h>
 #include <linux/percpu.h>
 #include <linux/percpu_counter.h>
@@ -17,14 +16,12 @@
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
 
-#define rs_lock_nested(l) spin_lock(l)
-#define rs_unlock_nested(l) spin_unlock(l)
 #endif
 
 #include "map.h"
 
 /*
- * 锁顺序：extent 哈希锁（按下标，discard 会一次拿多把）> prot_lock
+ * 锁顺序：extent 哈希锁（一次只拿一把）> prot_lock
  * > 本 CPU 预留锁 > 节点锁。查找和完成只 cmpxchg 页状态，不拿这些锁。
  * I/O 完成回调跑在软中断里，所以这里的锁都是关中断的自旋锁。
  */
@@ -305,10 +302,8 @@ static void rs_locks_once(void)
 	int i;
 
 	if (!rs_ext_locks_ready) {
-		for (i = 0; i < RS_EXT_LOCKS; i++) {
+		for (i = 0; i < RS_EXT_LOCKS; i++)
 			spin_lock_init(&rs_ext_locks[i]);
-			lockdep_set_novalidate_class(&rs_ext_locks[i]);
-		}
 		rs_ext_locks_ready = true;
 	}
 	if (rs_reserve_ready)
@@ -1140,44 +1135,6 @@ int rs_map_chunk_find(u16 node_id, u32 local_gid, u32 *global_gid)
 	return 0;
 }
 
-static void rs_lock_range(u32 e0, u32 e1, unsigned long *held, unsigned long *flags)
-{
-	u32 e;
-	int i, first = 1;
-	int words = (RS_EXT_LOCKS + BITS_PER_LONG - 1) / BITS_PER_LONG;
-
-	memset(held, 0, (size_t)words * sizeof(unsigned long));
-	for (e = e0; e <= e1; e++)
-		rs_bit_set(held, e & (RS_EXT_LOCKS - 1));
-	for (i = 0; i < RS_EXT_LOCKS; i++) {
-		if (!rs_bit(held, (u32)i))
-			continue;
-		if (first) {
-			spin_lock_irqsave(&rs_ext_locks[i], *flags);
-			first = 0;
-		} else {
-			rs_lock_nested(&rs_ext_locks[i]);
-		}
-	}
-}
-
-static void rs_unlock_range(const unsigned long *held, unsigned long flags)
-{
-	int i, last = -1;
-
-	for (i = 0; i < RS_EXT_LOCKS; i++) {
-		if (rs_bit(held, (u32)i))
-			last = i;
-	}
-	for (i = RS_EXT_LOCKS - 1; i >= 0; i--) {
-		if (!rs_bit(held, (u32)i) || i == last)
-			continue;
-		rs_unlock_nested(&rs_ext_locks[i]);
-	}
-	if (last >= 0)
-		spin_unlock_irqrestore(&rs_ext_locks[last], flags);
-}
-
 int rs_map_set_protection(u32 mode)
 {
 	struct rs_map *m = rs_map;
@@ -1268,10 +1225,9 @@ static void rs_account_discard(struct rs_map *m, struct rs_extent *ext, u8 state
 int rs_map_discard(u64 off, u32 len)
 {
 	struct rs_map *m = rs_map;
-	unsigned long held[(RS_EXT_LOCKS + BITS_PER_LONG - 1) / BITS_PER_LONG];
 	unsigned long flags;
 	u8 saved[RS_DISCARD_STACK];
-	u32 slot, n, e0, e1, i;
+	u32 slot, n;
 	int ret;
 
 	if (!m)
@@ -1280,50 +1236,51 @@ int rs_map_discard(u64 off, u32 len)
 	if (ret)
 		return ret;
 	n = len >> RS_PAGE_SHIFT;
-	e0 = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
-	e1 = (slot + n - 1) >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
-	rs_lock_range(e0, e1, held, &flags);
-	for (i = 0; i < n; i++) {
-		if (READ_ONCE(m->sstate[slot + i]) & RS_S_BUSY) {
-			ret = -EBUSY;
-			goto out;
-		}
-	}
-	for (i = 0; i < n; ) {
-		u32 win = n - i;
-		u32 j;
+	while (n) {
+		u32 ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
+		u32 room = RS_EXTENT_PAGES - (slot & (RS_EXTENT_PAGES - 1));
+		u32 chunk = n < room ? n : room;
+		u32 base = slot;
+		u32 i = 0;
+		int lock = ext_i & (RS_EXT_LOCKS - 1);
 
-		if (win > RS_DISCARD_STACK)
-			win = RS_DISCARD_STACK;
-		for (j = 0; j < win; j++)
-			saved[j] = READ_ONCE(m->sstate[slot + i + j]);
-		for (j = 0; j < win; j++) {
-			if (cmpxchg(&m->sstate[slot + i + j], saved[j],
-				    (u8)RS_S_ZERO) == saved[j])
-				continue;
-			while (j--) {
-				cmpxchg(&m->sstate[slot + i + j], (u8)RS_S_ZERO,
-					saved[j]);
+		spin_lock_irqsave(&rs_ext_locks[lock], flags);
+		for (i = 0; i < chunk; i++) {
+			if (READ_ONCE(m->sstate[base + i]) & RS_S_BUSY) {
+				spin_unlock_irqrestore(&rs_ext_locks[lock], flags);
+				return -EBUSY;
 			}
-			ret = -EBUSY;
-			goto out;
 		}
-		for (j = 0; j < win; j++) {
-			u32 ext_i;
-			struct rs_extent *ext;
+		for (i = 0; i < chunk; ) {
+			u32 win = chunk - i;
+			u32 j;
 
-			if (!(saved[j] & RS_S_USED))
-				continue;
-			ext_i = (slot + i + j) >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
-			ext = &m->extents[ext_i];
-			rs_account_discard(m, ext, saved[j]);
+			if (win > RS_DISCARD_STACK)
+				win = RS_DISCARD_STACK;
+			for (j = 0; j < win; j++)
+				saved[j] = READ_ONCE(m->sstate[base + i + j]);
+			for (j = 0; j < win; j++) {
+				if (cmpxchg(&m->sstate[base + i + j], saved[j],
+					    (u8)RS_S_ZERO) == saved[j])
+					continue;
+				while (j--)
+					cmpxchg(&m->sstate[base + i + j],
+						(u8)RS_S_ZERO, saved[j]);
+				spin_unlock_irqrestore(&rs_ext_locks[lock], flags);
+				return -EBUSY;
+			}
+			for (j = 0; j < win; j++) {
+				if (!(saved[j] & RS_S_USED))
+					continue;
+				rs_account_discard(m, &m->extents[ext_i], saved[j]);
+			}
+			i += win;
 		}
-		i += win;
+		spin_unlock_irqrestore(&rs_ext_locks[lock], flags);
+		slot += chunk;
+		n -= chunk;
 	}
-	ret = 0;
-out:
-	rs_unlock_range(held, flags);
-	return ret;
+	return 0;
 }
 
 void rs_map_finish(u64 off)

@@ -103,7 +103,10 @@ impl ConnPrivateData {
 const DEVICE_ATTR_MAX_QP: usize = 108;
 const DEVICE_ATTR_BYTES: usize = 232;
 
-pub fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
+/// # Safety
+///
+/// `ctx` 必须是仍有效的 `ibv_context`。
+pub unsafe fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
     let mut buf = vec![0u8; DEVICE_ATTR_BYTES];
     let rc = unsafe { sys::ibv_query_device(ctx, buf.as_mut_ptr() as *mut std::ffi::c_void) };
     if rc != 0 {

@@ -199,7 +199,7 @@ impl ProviderRuntime {
             ));
         }
 
-        let max_qp = match device_max_qp(rdma.context().as_ptr()) {
+        let max_qp = match unsafe { device_max_qp(rdma.context().as_ptr()) } {
             Ok(n) => n,
             Err(err) => {
                 unsafe {

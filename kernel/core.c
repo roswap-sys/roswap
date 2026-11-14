@@ -366,6 +366,7 @@ static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd, bool *done)
 static struct rs_qp *rs_qp_choose(struct rs_link *link, int hctx_set, bool read)
 {
 	struct rs_dev *want = rs_dev_of_set(hctx_set);
+	/* 配对 rs_link_alloc_qps 的 store-release，读到的 QP 数组已经初始化完。 */
 	struct rs_qp *qps = smp_load_acquire(&link->qps);
 	int n, i;
 
@@ -1135,7 +1136,14 @@ static void rs_exit_request(struct blk_mq_tag_set *set, struct request *rq,
 	cancel_work_sync(&cmd->done_work);
 }
 
+/*
+ * 6.1 起 map_queues 改成 void。5.10 到 6.0 还要返回 0。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static void rs_map_queues(struct blk_mq_tag_set *set)
+#else
 static int rs_map_queues(struct blk_mq_tag_set *set)
+#endif
 {
 	struct blk_mq_queue_map *qmap = &set->map[HCTX_TYPE_DEFAULT];
 	unsigned int cpu, q = 0;
@@ -1150,7 +1158,9 @@ static int rs_map_queues(struct blk_mq_tag_set *set)
 			rs_hctx_cpu[q] = (u16)cpu;
 		q++;
 	}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 	return 0;
+#endif
 }
 
 static const struct blk_mq_ops roswap_mq_ops = {
@@ -1518,6 +1528,7 @@ static int rs_link_alloc_qps(struct rs_link *link)
 		rs_qp_prep(&qps[s * 2 + 1], link, s, RS_QP_BULK);
 	}
 	link->nr_sets = k;
+	/* 数组里的 QP 都 prep 完再发布，queue_rq 才不会看到半初始化的指针。 */
 	smp_store_release(&link->qps, qps);
 	rs_qps_reserved += k * 2;
 	return 0;
