@@ -108,13 +108,25 @@ stop_io_loop() {
 	fi
 }
 
+unload_roswap() {
+	local i
+
+	[[ -d /sys/module/roswap ]] || return 0
+	for i in $(seq 1 30); do
+		if rmmod roswap 2>/dev/null; then
+			return 0
+		fi
+		[[ -d /sys/module/roswap ]] || return 0
+		sleep 0.1
+	done
+	rmmod roswap
+}
+
 e2e_stop_stack() {
 	stop_io_loop || true
 	swapoff /dev/roswap0 2>/dev/null || true
 	rmdir /sys/fs/cgroup/roswap-e2e 2>/dev/null || true
-	if [[ -d /sys/module/roswap ]]; then
-		rmmod roswap || true
-	fi
+	unload_roswap || true
 	stop_pid_file "$E2E_LOG_DIR/provider.pid"
 	stop_pid_file "$E2E_LOG_DIR/controller.pid"
 	stop_pid_file "$E2E_LOG_DIR/dmesg.pid"

@@ -284,7 +284,10 @@ static void rs_link_kick(struct rs_link *link)
 		return;
 	if (atomic_cmpxchg(&link->state, old, RS_LINK_RECOVERING) != old)
 		return;
-	if (!link->recover_deadline)
+	/*
+	 * 上次放弃后 deadline 还停在过去。不刷新的话，新的一轮会立刻再放弃。
+	 */
+	if (!link->recover_deadline || time_after(jiffies, link->recover_deadline))
 		link->recover_deadline = jiffies +
 					 msecs_to_jiffies(ROSWAP_RECOVER_LIMIT_MS);
 	mod_delayed_work(roswap_cm, &link->recover_dwork, 0);
@@ -1876,10 +1879,20 @@ static void rs_key_updated(u16 node_id)
 		return;
 	}
 	atomic_inc(&link->key_gen);
+	WRITE_ONCE(link->key_wait, false);
+	/*
+	 * rkey 换了就要重新给这一轮计时。链路已经放弃时，旧 deadline 在过去，
+	 * 不重置的话 recover 会马上再打印 gave up。
+	 */
+	link->recover_deadline = jiffies + msecs_to_jiffies(ROSWAP_RECOVER_LIMIT_MS);
 	wake_up(&link->wq);
-	if (atomic_read(&link->state) == RS_LINK_FATAL)
-		atomic_cmpxchg(&link->state, RS_LINK_FATAL, RS_LINK_OFF);
-	rs_link_kick(link);
+	if (atomic_read(&link->state) != RS_LINK_UP) {
+		if (atomic_read(&link->state) == RS_LINK_FATAL)
+			atomic_cmpxchg(&link->state, RS_LINK_FATAL, RS_LINK_OFF);
+		rs_link_kick(link);
+		/* 正在收尾的 recover 会忽略 kick。再排一次，用新的 deadline 重连。 */
+		mod_delayed_work(roswap_cm, &link->recover_dwork, 0);
+	}
 	rcu_read_unlock();
 }
 

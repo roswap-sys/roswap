@@ -173,7 +173,8 @@ scenario_params() {
 	say "不写 local_addrs"
 	insmod "$ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB"
 	[[ -b /dev/roswap0 ]] || die "默认参数没有建出 /dev/roswap0"
-	rmmod roswap
+	# 新块设备刚注册时，udev 可能还握着打开的 fd，rmmod 会暂时报 in use。
+	unload_roswap
 	say "params 通过"
 }
 
