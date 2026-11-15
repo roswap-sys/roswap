@@ -101,6 +101,9 @@ impl ConnPrivateData {
 const DEVICE_ATTR_MAX_QP: usize = 108;
 const DEVICE_ATTR_BYTES: usize = 232;
 
+/// # Safety
+///
+/// `ctx` must point to a live `ibv_context`.
 pub unsafe fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
     let mut buf = vec![0u8; DEVICE_ATTR_BYTES];
     let rc = unsafe { sys::ibv_query_device(ctx, buf.as_mut_ptr() as *mut std::ffi::c_void) };
@@ -165,6 +168,10 @@ pub struct CmEventView {
     pub private_data: Option<ConnPrivateData>,
 }
 
+/// # Safety
+///
+/// `raw` must point to an event from `rdma_get_cm_event` that has not been acked.
+/// `rdma_ack_cm_event` frees the event and its private data.
 pub unsafe fn snapshot_cm_event(raw: *const sys::rdma_cm_event) -> CmEventView {
     let ev = &*raw;
     CmEventView {

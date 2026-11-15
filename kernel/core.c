@@ -360,6 +360,7 @@ static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd, bool *done)
 static struct rs_qp *rs_qp_choose(struct rs_link *link, int hctx_set, bool read)
 {
 	struct rs_dev *want = rs_dev_of_set(hctx_set);
+	/* Pairs with the store-release in rs_link_alloc_qps. The QP array is initialized. */
 	struct rs_qp *qps = smp_load_acquire(&link->qps);
 	int n, i;
 
@@ -1526,6 +1527,7 @@ static int rs_link_alloc_qps(struct rs_link *link)
 		rs_qp_prep(&qps[s * 2 + 1], link, s, RS_QP_BULK);
 	}
 	link->nr_sets = k;
+	/* Publish only after every QP is prepared, so queue_rq never sees a partial array. */
 	smp_store_release(&link->qps, qps);
 	rs_qps_reserved += k * 2;
 	return 0;

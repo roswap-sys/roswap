@@ -360,6 +360,9 @@ pub struct rdma_cm_event {
     pub conn: rdma_conn_param,
 }
 
+/// # Safety
+///
+/// `qp` must be a valid QP. The `wr` list and `bad_wr` must be accessible for the call.
 #[inline]
 pub unsafe fn ibv_post_send(
     qp: *mut ibv_qp,
@@ -372,6 +375,9 @@ pub unsafe fn ibv_post_send(
     }
 }
 
+/// # Safety
+///
+/// `cq` must be a valid CQ. `wc` must hold at least `num_entries` elements.
 #[inline]
 pub unsafe fn ibv_poll_cq(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) -> c_int {
     match (*(*cq).context).ops.poll_cq {
