@@ -2,11 +2,6 @@
 #ifndef _ROSWAP_MAP_H
 #define _ROSWAP_MAP_H
 
-/*
- * Slot / Extent 映射。Extent 固定 1MB，loc = (chunk_gid << 10) | ext_idx。
- * 读者在 I/O 路径上调用，分配器本身用一把自旋锁挡住 discard。
- */
-
 #ifdef RS_MAP_TEST
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,10 +16,6 @@ typedef uint64_t u64;
 
 #define RS_MAP_ZERO		1
 #define RS_MAX_NODES		256
-/*
- * loc 把全局 chunk 号放在高 22 位，extent 下标占低 10 位。
- * 页号是 u32，16TiB 整除时页数是 2^32，装不进页号，所以容量停在 16TiB - 1MiB。
- */
 #define RS_GID_BITS		22
 #define RS_MAX_GLOBAL_CHUNKS	(1u << RS_GID_BITS)
 #define RS_MAX_CAPACITY_MB	((u32)~0U >> 8)
@@ -72,7 +63,6 @@ void rs_map_exit(void);
 int rs_map_node_add(u16 node_id);
 int rs_map_chunk_add(u16 node_id, u32 local_gid, u32 epoch, u64 raddr, u32 rkey,
 		     u32 chunk_mb);
-/* 按 (node_id, 本地 gid) 换钥匙。0 没变，1 换过，负数为错误。 */
 int rs_map_chunk_update(u16 node_id, u32 local_gid, u32 epoch, u64 raddr,
 			u32 rkey);
 int rs_map_chunk_find(u16 node_id, u32 local_gid, u32 *global_gid);
@@ -83,7 +73,6 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_copies *out);
 int rs_map_discard(u64 off, u32 len);
 void rs_map_finish(u64 off);
 void rs_map_finish_write(u64 off, u8 ok_mask);
-/* bit0、bit1 已到达，bit4、bit5 成功，bit8、bit9 已发送，bit30 已有人收尾。 */
 #define RS_COPY_SENT_SHIFT	8
 #define RS_COPY_FINISH		0x40000000u
 

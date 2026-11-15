@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0
-# 端到端场景的公共函数。由 run.sh source，不要直接执行。
 
 E2E_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$E2E_DIR/../.." && pwd)
@@ -11,7 +10,6 @@ MEMHOLD=${MEMHOLD:-$ROOT/tools/memhold}
 CHUNK_MB=64
 CAPACITY_MB=128
 MEM_DIR=/dev/shm/roswap-e2e
-# 避开 roswapd 的默认端口，本机已有守护进程时也能跑。
 E2E_CTRL_PORT=12321
 E2E_GRPC_PORT=12320
 
@@ -25,7 +23,7 @@ die() {
 }
 
 require_file() {
-	[[ -e $1 ]] || die "找不到 $1"
+	[[ -e $1 ]] || die "not found: $1"
 }
 
 e2e_rdma_dev() {
@@ -33,7 +31,7 @@ e2e_rdma_dev() {
 		printf '%s\n' "$ROSWAP_E2E_DEV"
 		return
 	fi
-	[[ -d /sys/class/infiniband/rxe0 ]] || die "没有 rxe0。先加载 rdma_rxe 并 rdma link add，或设置 ROSWAP_E2E_DEV"
+	[[ -d /sys/class/infiniband/rxe0 ]] || die "no rxe0. Load rdma_rxe and run rdma link add, or set ROSWAP_E2E_DEV"
 	printf '%s\n' rxe0
 }
 
@@ -49,10 +47,10 @@ e2e_rdma_ip() {
 			for (i = 1; i <= NF; i++) if ($i == "netdev") nd = $(i + 1)
 		}
 		END { print nd }')
-	[[ -n $netdev ]] || die "rdma link show 里没有 $dev"
+	[[ -n $netdev ]] || die "$dev is not in rdma link show"
 	ip=$(ip -4 -o addr show dev "$netdev" | awk 'NR == 1 { print $4 }')
 	ip=${ip%%/*}
-	[[ -n $ip ]] || die "$dev 的网卡 $netdev 没有 IPv4"
+	[[ -n $ip ]] || die "netdev $netdev for $dev has no IPv4"
 	printf '%s\n' "$ip"
 }
 
@@ -71,11 +69,11 @@ wait_for() {
 	until "$@"; do
 		rc=$?
 		if (( rc >= 2 )); then
-			printf 'e2e: %s 失败\n' "$desc" >&2
+			printf 'e2e: %s failed\n' "$desc" >&2
 			return "$rc"
 		fi
 		if (( SECONDS - start >= timeout )); then
-			printf 'e2e: 等待超时: %s\n' "$desc" >&2
+			printf 'e2e: timed out: %s\n' "$desc" >&2
 			return 1
 		fi
 		sleep 0.2
@@ -163,14 +161,14 @@ start_dmesg_follow() {
 	sleep 0.2
 	if ! kill -0 "$(cat "$E2E_LOG_DIR/dmesg.pid")" 2>/dev/null; then
 		rm -f "$E2E_LOG_DIR/dmesg.pid"
-		say "dmesg -w 不可用，失败时改看 dmesg 快照"
+		say "dmesg -w is unavailable; check the dmesg snapshot on failure"
 	fi
 }
 
 e2e_init() {
 	local dev ip
 
-	[[ $(id -u) -eq 0 ]] || die "需要 root（加载模块、配置 swap）"
+	[[ $(id -u) -eq 0 ]] || die "root is required to load the module and configure swap"
 	require_file "$ROSWAPD"
 	require_file "$ROSWAPCTL"
 	require_file "$BLKCHECK"
@@ -191,40 +189,38 @@ e2e_init() {
 }
 
 start_controller() {
-	say "启动 controller"
+	say "starting controller"
 	"$ROSWAPD" "$E2E_LOG_DIR/controller.toml" >>"$E2E_LOG_DIR/controller.log" 2>&1 &
 	echo $! >"$E2E_LOG_DIR/controller.pid"
-	wait_for "controller 监听 ${E2E_CTRL_PORT}" 20 controller_ready
+	wait_for "controller listening on ${E2E_CTRL_PORT}" 20 controller_ready
 }
 
 controller_ready() {
 	local pid
 	pid=$(cat "$E2E_LOG_DIR/controller.pid")
 	if ! kill -0 "$pid" 2>/dev/null; then
-		echo "controller 进程已退出，见 $E2E_LOG_DIR/controller.log" >&2
+		echo "controller exited; see $E2E_LOG_DIR/controller.log" >&2
 		return 2
 	fi
 	port_listening "$E2E_CTRL_PORT"
 }
 
-# 脚本开了 pipefail，不要写 "cmd | grep -q"：grep 提前退出时 cmd 会被 SIGPIPE 打断，
-# 整条管道按失败算。
 port_listening() {
 	[[ -n $(ss -Hltn "sport = :$1") ]]
 }
 
 start_provider() {
-	say "启动 provider"
+	say "starting provider"
 	"$ROSWAPD" "$E2E_LOG_DIR/provider.toml" >>"$E2E_LOG_DIR/provider.log" 2>&1 &
 	echo $! >"$E2E_LOG_DIR/provider.pid"
-	wait_for "provider 监听 ${E2E_GRPC_PORT}" 30 provider_ready
+	wait_for "provider listening on ${E2E_GRPC_PORT}" 30 provider_ready
 }
 
 provider_ready() {
 	local pid
 	pid=$(cat "$E2E_LOG_DIR/provider.pid")
 	if ! kill -0 "$pid" 2>/dev/null; then
-		echo "provider 进程已退出，见 $E2E_LOG_DIR/provider.log" >&2
+		echo "provider exited; see $E2E_LOG_DIR/provider.log" >&2
 		return 2
 	fi
 	grep -q "provider initialized" "$E2E_LOG_DIR/provider.log" || return 1
@@ -232,12 +228,10 @@ provider_ready() {
 }
 
 load_module() {
-	say "加载 roswap.ko"
-	# insmod 不处理依赖。rxe 只带起 ib_core，rdma_resolve_addr 这些符号在 rdma_cm 里。
-	# 测试虚拟机把 rdma_cm 编进了内核，modprobe 找不到模块是正常的。
+	say "loading roswap.ko"
 	modprobe -q rdma_cm 2>/dev/null || true
 	insmod "$ROOT/kernel/roswap.ko" chunk_size_mb="$CHUNK_MB" capacity_mb="$CAPACITY_MB"
-	[[ -b /dev/roswap0 ]] || die "insmod 之后没有 /dev/roswap0"
+	[[ -b /dev/roswap0 ]] || die "/dev/roswap0 is missing after insmod"
 }
 
 kernel_ready() {
@@ -251,7 +245,7 @@ kernel_ready() {
 }
 
 wait_kernel() {
-	wait_for "chunk 下发并且链路 up" 30 kernel_ready
+	wait_for "chunk applied and link up" 30 kernel_ready
 	"$ROSWAPCTL" status
 	"$ROSWAPCTL" cluster "127.0.0.1:${E2E_CTRL_PORT}"
 }

@@ -14,7 +14,6 @@ on:
     branches: [ "master" ]
     paths: *paths
   schedule:
-    # 新发布的 stable / rc 不用等代码改动就能发现问题。
     - cron: '0 18 * * *'
   workflow_dispatch:
 
@@ -46,8 +45,6 @@ jobs:
     - name: Map allocator tests
       run: make -C kernel map-test
 
-  # 每个维护中的 LTS 分支、最新 stable 和 mainline rc 各编一次 roswap.ko。
-  # 只编译不运行；运行时测试见 e2e.yml 的 vm job。
   compat:
     name: build on ${{ matrix.kernel }}
     runs-on: ubuntu-24.04
@@ -58,7 +55,6 @@ jobs:
       matrix:
         kernel: [ "5.10", "5.15", "6.1", "6.6", "6.12", "6.18", "stable" ]
         include:
-          # 5.x 早于 GCC 13，用同代的 GCC 编，避免新编译器在老内核头文件里报出的无关警告。
           - kernel: "5.10"
             cc: "gcc-11"
           - kernel: "5.15"

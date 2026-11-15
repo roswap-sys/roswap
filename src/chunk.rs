@@ -47,7 +47,6 @@ impl Chunk {
             .open(&file_path)?;
         let existing = file.metadata()?.len();
         if existing == 0 {
-            // ftruncate 只改长度。fallocate 会先按 4K 把页分配出来，MADV_HUGEPAGE 就不起作用。
             file.set_len(len as u64)?;
         } else if existing != len as u64 {
             return Err(io::Error::new(
@@ -59,7 +58,6 @@ impl Chunk {
             ));
         }
 
-        // 先映射、再给大页提示、最后才 fault。MAP_POPULATE 会在提示之前按 4K 把页填上。
         let raw_addr = unsafe {
             sys::mmap(
                 std::ptr::null_mut(),
@@ -111,7 +109,7 @@ impl Chunk {
         self.addr.as_ptr() as u64
     }
 
-    #[allow(clippy::len_without_is_empty)] // create 拒绝 0 长度，chunk 不会为空
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.len
     }

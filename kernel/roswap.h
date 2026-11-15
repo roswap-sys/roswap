@@ -17,12 +17,9 @@
 #define ROSWAP_QUEUE_DEPTH	128
 #define ROSWAP_CM_TIMEOUT_MS	2000
 #define ROSWAP_CONNECT_TIMEOUT_MS 30000
-/* 设计里的 dead_after_s。到点还没连上就结束等待中的 I/O，避免回收路径一直堵着。 */
 #define ROSWAP_RECOVER_LIMIT_MS	10000
 #define ROSWAP_FAULT_POLL_US	20
-/* 4.096us * 2^14 ≈ 67ms。retry_count 4 时在途请求大约 335ms 报错。 */
 #define ROSWAP_ACK_TIMEOUT	14
-/* 第一份读超过这个时间还没回来，就向另一份副本再发一次。 */
 #define ROSWAP_HEDGE_US		1500
 
 enum rs_link_state {
@@ -33,10 +30,6 @@ enum rs_link_state {
 	RS_LINK_FATAL = 4,
 };
 
-/*
- * Generic Netlink "roswap"。数字是用户态 ABI，改之前要一起改 src/genl.rs。
- * NODE_ADD 只登记地址。CHUNK_ADD / CHUNK_UPDATE 以 (node_id, 本地 gid) 为键。
- */
 enum rs_genl_cmd {
 	RS_CMD_UNSPEC,
 	RS_CMD_NODE_ADD,
@@ -64,10 +57,6 @@ enum rs_genl_attr {
 };
 #define RS_A_MAX (__RS_A_MAX - 1)
 
-/*
- * 48 字节，网络序。rsvd2[0] 是客户端声称的 Chunk 大小，单位 MiB。
- * 提供端据此拒绝比 MR 更大的磁盘，避免越界 RDMA 把 QP 打进 ERR。
- */
 struct rs_conn_pdata {
 	__be32 magic;
 	__be16 version;

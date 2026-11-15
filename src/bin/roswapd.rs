@@ -113,7 +113,6 @@ fn init_tracing() {
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
-    // log 宏转给上面的 tracing 订阅器。本机 rust-analyzer 展开不了 tracing 的 event 宏。
     let _ = tracing_log::LogTracer::builder()
         .with_max_level(log_filter)
         .init();

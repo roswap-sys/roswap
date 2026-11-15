@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Generic Netlink `roswap`。属性编号和 `kernel/roswap.h` 是同一份 ABI。
 
 use std::io;
 use std::os::fd::RawFd;
@@ -253,7 +252,6 @@ fn align(n: usize) -> usize {
     (n + 3) & !3
 }
 
-/// 从一次 `recv` 里取出本 seq 的应答。返回 `true` 表示已经看到 ACK。
 fn absorb_reply(data: &mut Vec<u8>, buf: &[u8], expect_type: u16, seq: u32) -> io::Result<bool> {
     let mut offset = 0;
     while offset + NLMSG_HDRLEN <= buf.len() {

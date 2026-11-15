@@ -1,13 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# virtme-ng 虚拟机里的测试入口。以 root 运行，宿主机的根文件系统只读挂进来，
-# 只有 E2E_OUT 所在目录可写，结果和日志都放在那里，宿主机读 $E2E_OUT/result 判断成败。
-#   tests/e2e/vm-run.sh <输出目录> [场景...]
 
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-E2E_OUT=${1:?用法: $0 <输出目录> [场景...]}
+E2E_OUT=${1:?usage: $0 <output-dir> [scenarios...]}
 shift
 scenarios=("$@")
 if [[ ${#scenarios[@]} -eq 0 ]]; then

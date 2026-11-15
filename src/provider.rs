@@ -30,20 +30,16 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
-    /// 空字符串或省略表示自动选择 RDMA 设备。
     #[serde(deserialize_with = "empty_string_as_none")]
     pub device_name: Option<String>,
-    /// `0.0.0.0` 只表示端口；实际会绑到所选 RDMA 设备的 IPv4，避免连接落到另一块设备上。
     pub listen_addr: SocketAddrV4,
     pub grpc_addr: SocketAddr,
     pub mem_dir: PathBuf,
     pub chunk_size_mb: usize,
     pub num_chunks: usize,
     pub node_epoch: u32,
-    /// 向 controller 注册时用的节点号。0 留给 insmod 手工带起来的那条链路。
     #[serde(default = "default_node_id")]
     pub node_id: u16,
-    /// 空字符串表示不向 controller 注册。
     #[serde(default)]
     pub controller_addr: String,
 }
@@ -289,7 +285,6 @@ impl ProviderRuntime {
             return Err(io::Error::last_os_error());
         }
 
-        // ack 会释放事件以及 private_data 缓冲，所以先把要用的字段拷到自己的内存里。
         let ev = unsafe { snapshot_cm_event(raw_ev) };
         unsafe {
             let _ = sys::rdma_ack_cm_event(raw_ev);
@@ -562,7 +557,6 @@ mod tests {
         let needle = path.to_string_lossy();
         let mut in_region = false;
         for line in text.lines() {
-            // 映射头是 "addr-addr rw-s ... path"。设备号里也有冒号，不能靠冒号区分。
             if smaps_header(line) {
                 in_region = line.contains(needle.as_ref());
                 continue;
@@ -643,7 +637,6 @@ mod tests {
             chunk.as_mut_slice()[0..8].copy_from_slice(b"ROSWAP01");
         }
 
-        // Simulate agent crash/restart: file still exists on tmpfs/hugetlbfs, reopen and verify content
         let chunk_reopened =
             Chunk::create(rdma.pd(), &test_dir, 7, 1, 4 << 20).expect("reopen chunk");
         assert_eq!(&chunk_reopened.as_slice()[0..8], b"ROSWAP01");
@@ -697,7 +690,6 @@ mod tests {
             provider
         });
 
-        // Client side: simulate roswap.ko connecting via rdma_cm and issuing 4KB one-sided RDMA WRITE & READ
         unsafe {
             let ch = sys::rdma_create_event_channel();
             assert!(!ch.is_null());
@@ -775,7 +767,6 @@ mod tests {
             assert_eq!((*ev).event, sys::RDMA_CM_EVENT_ESTABLISHED);
             sys::rdma_ack_cm_event(ev);
 
-            // Allocate two local 4KB pages (write_buf and read_buf)
             let mut write_buf = vec![0u8; 4096];
             for (i, b) in write_buf.iter_mut().enumerate() {
                 *b = ((i * 31 + 7) & 0xFF) as u8;
@@ -796,7 +787,6 @@ mod tests {
             );
             assert!(!write_mr.is_null() && !read_mr.is_null());
 
-            // 1. One-sided RDMA WRITE 4KB to provider chunk at offset 64KB
             let page_offset = 64 * 1024;
             let mut sge_w = sys::ibv_sge {
                 addr: write_buf.as_ptr() as u64,
@@ -820,7 +810,6 @@ mod tests {
             assert_eq!(wc.status, sys::IBV_WC_SUCCESS);
             assert_eq!(wc.wr_id, 101);
 
-            // 2. One-sided RDMA READ 4KB back from provider chunk at offset 64KB
             let mut sge_r = sys::ibv_sge {
                 addr: read_buf.as_mut_ptr() as u64,
                 length: 4096,
@@ -841,7 +830,6 @@ mod tests {
             assert_eq!(wc.wr_id, 102);
             assert_eq!(write_buf, read_buf);
 
-            // 3. One-sided RDMA READ 8-byte heartbeat counter
             let mut hb_sge = sys::ibv_sge {
                 addr: read_buf.as_mut_ptr() as u64,
                 length: 8,

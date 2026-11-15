@@ -1,11 +1,7 @@
-# Out-of-tree module. Build inside the lab VM, against that VM's headers:
-#   make -C kernel
-#   make -C /lib/modules/$(uname -r)/build M=$PWD/kernel modules
 ifneq ($(KERNELRELEASE),)
 obj-m := roswap.o
 roswap-y := core.o map.o genl.o
 
-# 没有 OFED 树就用内核自带的 rdma/ 头。这条路径没有在 MLNX_OFED 上编过。
 OFA_KERNEL := /usr/src/ofa_kernel/default
 ifneq ($(wildcard $(OFA_KERNEL)/include/rdma/rdma_cm.h),)
 NOSTDINC_FLAGS += -I$(OFA_KERNEL)/include

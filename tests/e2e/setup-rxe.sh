@@ -1,7 +1,5 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# 在一对 veth 上建 Soft-RoCE 设备 rxe0。需要 root。
-# 托管 runner 上 rdma_rxe 是模块；测试虚拟机里它编进了内核，modprobe 失败不要紧。
 
 set -euo pipefail
 
@@ -33,5 +31,5 @@ for _ in $(seq 1 50); do
 	sleep 0.1
 done
 rdma link show >&2 || true
-echo "setup-rxe: rxe0 没有拿到 192.168.88.1 的 GID" >&2
+echo "setup-rxe: rxe0 has no GID for 192.168.88.1" >&2
 exit 1

@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * 两个线程同时给同一页的两份副本登记结果。
- * 结束条件只有一个：恰好一次 PUBLISH，或恰好一次 FAIL。
- * 5 秒出不来就当成死锁。
- */
 #define _GNU_SOURCE
 #include "map.c"
 

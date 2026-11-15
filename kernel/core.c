@@ -23,12 +23,6 @@
 #include "compat.h"
 #include "roswap.h"
 
-/*
- * 锁顺序：rs_link_mu（节点增删）> qp->poll_lock。
- * queue_rq、完成回调、对冲回调不拿可睡眠的锁。QP 指针靠 RCU 读，
- * 拆除方先把状态改成 DRAINING，synchronize_rcu 之后才销毁。
- */
-
 static char *server;
 module_param(server, charp, 0444);
 MODULE_PARM_DESC(server, "provider rdma_cm address, ip:port");
@@ -284,9 +278,6 @@ static void rs_link_kick(struct rs_link *link)
 		return;
 	if (atomic_cmpxchg(&link->state, old, RS_LINK_RECOVERING) != old)
 		return;
-	/*
-	 * 上次放弃后 deadline 还停在过去。不刷新的话，新的一轮会立刻再放弃。
-	 */
 	if (!link->recover_deadline || time_after(jiffies, link->recover_deadline))
 		link->recover_deadline = jiffies +
 					 msecs_to_jiffies(ROSWAP_RECOVER_LIMIT_MS);
@@ -369,7 +360,6 @@ static void rs_fault_poll(struct rs_qp *qp, struct roswap_cmd *cmd, bool *done)
 static struct rs_qp *rs_qp_choose(struct rs_link *link, int hctx_set, bool read)
 {
 	struct rs_dev *want = rs_dev_of_set(hctx_set);
-	/* 配对 rs_link_alloc_qps 的 store-release，读到的 QP 数组已经初始化完。 */
 	struct rs_qp *qps = smp_load_acquire(&link->qps);
 	int n, i;
 
@@ -973,7 +963,6 @@ static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
 		u32 primary = 0;
 		struct rs_bounce *probe = rs_bounce_get(bounce_set);
 
-		/* 池空就直接读到请求页，不因为对冲缓冲不够而失败。 */
 		if (!probe)
 			goto direct;
 		rs_bounce_free(probe, false);
@@ -1111,7 +1100,6 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 	return rs_post_copies(rq, cmd, &copies, pick, ready, &bv, off, read, set);
 }
 
-/* 7.2 起最后一个参数从 unsigned int 改成 int。 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
 static int rs_init_request(struct blk_mq_tag_set *set, struct request *rq,
 			   unsigned int hctx_idx, int numa_node)
@@ -1145,9 +1133,6 @@ static void rs_exit_request(struct blk_mq_tag_set *set, struct request *rq,
 	cancel_work_sync(&cmd->done_work);
 }
 
-/*
- * 6.1 起 map_queues 改成 void。5.10 到 6.0 还要返回 0。
- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 static void rs_map_queues(struct blk_mq_tag_set *set)
 #else
@@ -1256,10 +1241,6 @@ static int rs_comp_vector(struct ib_device *dev, unsigned int cpu)
 
 	if (n <= 1)
 		return 0;
-	/*
-	 * 7.1 删掉了 ib_get_vector_affinity。拿不到亲和性时按 CPU 取模，
-	 * 完成中断仍然摊到不同的向量上。
-	 */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
 	for (v = 0; v < n; v++) {
 		const struct cpumask *mask = ib_get_vector_affinity(dev, v);
@@ -1545,7 +1526,6 @@ static int rs_link_alloc_qps(struct rs_link *link)
 		rs_qp_prep(&qps[s * 2 + 1], link, s, RS_QP_BULK);
 	}
 	link->nr_sets = k;
-	/* 数组里的 QP 都 prep 完再发布，queue_rq 才不会看到半初始化的指针。 */
 	smp_store_release(&link->qps, qps);
 	rs_qps_reserved += k * 2;
 	return 0;
@@ -1880,17 +1860,12 @@ static void rs_key_updated(u16 node_id)
 	}
 	atomic_inc(&link->key_gen);
 	WRITE_ONCE(link->key_wait, false);
-	/*
-	 * rkey 换了就要重新给这一轮计时。链路已经放弃时，旧 deadline 在过去，
-	 * 不重置的话 recover 会马上再打印 gave up。
-	 */
 	link->recover_deadline = jiffies + msecs_to_jiffies(ROSWAP_RECOVER_LIMIT_MS);
 	wake_up(&link->wq);
 	if (atomic_read(&link->state) != RS_LINK_UP) {
 		if (atomic_read(&link->state) == RS_LINK_FATAL)
 			atomic_cmpxchg(&link->state, RS_LINK_FATAL, RS_LINK_OFF);
 		rs_link_kick(link);
-		/* 正在收尾的 recover 会忽略 kick。再排一次，用新的 deadline 重连。 */
 		mod_delayed_work(roswap_cm, &link->recover_dwork, 0);
 	}
 	rcu_read_unlock();

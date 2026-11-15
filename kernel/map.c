@@ -20,12 +20,6 @@
 
 #include "map.h"
 
-/*
- * 锁顺序：extent 哈希锁（一次只拿一把）> prot_lock
- * > 本 CPU 预留锁 > 节点锁。查找和完成只 cmpxchg 页状态，不拿这些锁。
- * I/O 完成回调跑在软中断里，所以这里的锁都是关中断的自旋锁。
- */
-
 #define RS_PAGE_SHIFT		12
 #define RS_PAGE_SIZE		(1u << RS_PAGE_SHIFT)
 #define RS_EXTENT_SHIFT		20
@@ -35,7 +29,6 @@
 #define RS_EXT_LOCKS		4096
 #define RS_DISCARD_STACK	64
 
-/* rcu 必须是第一个成员，用户态测试按这个地址释放。 */
 struct rs_chunk_key {
 	struct rcu_head rcu;
 	u32 epoch;
@@ -94,7 +87,6 @@ struct rs_map {
 	struct xarray nodes;
 };
 
-/* 这一位只在 map.c 里用：该页已经算进 degraded_slots。 */
 #define RS_S_SHORT		0x80
 
 u32 rs_copy_note(u32 word, u32 which, bool success)
@@ -386,7 +378,6 @@ static struct rs_node *rs_node_nth(struct rs_map *m, u16 exclude, bool use_exclu
 	return NULL;
 }
 
-/* 候选按节点号排序。随机数的消耗和原来的两次取模一致，这样放置测试不变。 */
 static struct rs_node *rs_pick_node(struct rs_map *m, u16 exclude, bool use_exclude)
 {
 	struct rs_node *a_node, *b_node;
@@ -514,7 +505,6 @@ static void rs_release_loc(struct rs_map *m, u32 loc)
 	rs_release_bitmap(m, loc);
 }
 
-/* 从别的 CPU 预留里拿走一份。exclude 为 RS_MAX_NODES 时不限制节点。调用方已 pin。 */
 static int rs_steal_loc(struct rs_map *m, u16 exclude, u32 *loc)
 {
 	int me = rs_reserve_me();
@@ -863,10 +853,6 @@ int rs_map_init(u32 capacity_mb)
 	}
 	m->counters = true;
 	spin_lock_init(&m->prot_lock);
-	/*
-	 * xa_alloc 只在标了 XA_FLAGS_ALLOC 的数组上合法。5.10 否则会
-	 * WARN 并返回 -EINVAL，chunk 加不进去。
-	 */
 #ifdef RS_MAP_TEST
 	xa_init(&m->chunks);
 #else

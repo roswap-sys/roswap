@@ -7,27 +7,14 @@
 #include <linux/version.h>
 #include <net/netlink.h>
 
-/*
- * 5.11 把 nla_strlcpy 改名为 nla_strscpy，截断时返回 -E2BIG。
- * 策略里已经限制了长度，旧接口不会截断，返回值只用来判负。
- */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 #define nla_strscpy(dst, nla, size) ((ssize_t)nla_strlcpy(dst, nla, size))
 #endif
 
-/*
- * 5.17 起 GENHD_FL_NO_PART 是枚举常量，不是宏。#ifndef 看不出枚举，
- * 再定义成 0 会把标志悄悄清掉。只在更老的宏接口上补别名。
- */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0) && !defined(GENHD_FL_NO_PART)
 #define GENHD_FL_NO_PART GENHD_FL_NO_PART_SCAN
 #endif
 
-/*
- * 5.10 没有 blk_mq_alloc_disk。5.14 引入两参数版本和 blk_cleanup_disk，
- * 6.0 起改回 put_disk，6.9 起分配时直接吃 queue_limits，6.11 起
- * 非旋转是默认值，QUEUE_FLAG_NONROT 被删掉。
- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
 static inline struct gendisk *roswap_alloc_disk(struct blk_mq_tag_set *set)
 {
@@ -50,7 +37,6 @@ static inline struct gendisk *roswap_alloc_disk(struct blk_mq_tag_set *set)
 }
 #endif
 
-/* 6.0 去掉了 busy_tag_iter_fn 的 reserved 参数。 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 #define ROSWAP_BUSY_ITER_ARGS struct request *rq, void *data
 #else
@@ -72,7 +58,6 @@ static inline void roswap_apply_queue_limits(struct gendisk *disk)
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->queue);
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
-	/* 6.0 删掉了这个 flag，非零的 max_discard_sectors 就表示支持 discard。 */
 	blk_queue_flag_set(QUEUE_FLAG_DISCARD, disk->queue);
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)

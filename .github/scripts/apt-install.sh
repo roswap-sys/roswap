@@ -1,5 +1,4 @@
 #!/bin/bash
-# Ubuntu 官方源（azure/archive/security.ubuntu.com）解析失败时，改走独立镜像再装一次。
 set -euo pipefail
 
 apt_get() {

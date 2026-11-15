@@ -2,7 +2,6 @@
 #ifndef _ROSWAP_MAP_USER_H
 #define _ROSWAP_MAP_USER_H
 
-/* 让 map.c 在用户态被直接编进分配器测试，不拉内核头。 */
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -14,11 +13,6 @@
 
 typedef unsigned long xa_mark_t;
 
-/*
- * 故意不提供 spin_lock / spin_unlock。完成回调在硬中断里，
- * 进程上下文必须关中断，map.c 里写了裸 spin_lock 就让 map-test 编不过。
- * irqsave 版本在用户态是互斥锁，多线程测试才能抓住死锁。
- */
 typedef struct {
 	pthread_mutex_t mu;
 } spinlock_t;

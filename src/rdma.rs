@@ -5,7 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ptr::NonNull;
 
-pub const RS_CONN_MAGIC: u32 = 0x5253_5750; // "RSWP"
+pub const RS_CONN_MAGIC: u32 = 0x5253_5750;
 pub const RS_CONN_VERSION: u16 = 1;
 
 #[repr(u8)]
@@ -89,7 +89,6 @@ impl ConnPrivateData {
         u32::from_be(self.node_epoch_be)
     }
 
-    /// `rsvd2[0]`，单位 MiB。头长仍是 48 字节。
     pub fn set_chunk_size_mb(&mut self, mb: u32) {
         self.rsvd2[0] = mb.to_be();
     }
@@ -99,13 +98,9 @@ impl ConnPrivateData {
     }
 }
 
-/// `offsetof(ibv_device_attr, max_qp)`。结构体 232 字节，这里只读这一个字段。
 const DEVICE_ATTR_MAX_QP: usize = 108;
 const DEVICE_ATTR_BYTES: usize = 232;
 
-/// # Safety
-///
-/// `ctx` 必须是仍有效的 `ibv_context`。
 pub unsafe fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
     let mut buf = vec![0u8; DEVICE_ATTR_BYTES];
     let rc = unsafe { sys::ibv_query_device(ctx, buf.as_mut_ptr() as *mut std::ffi::c_void) };
@@ -126,7 +121,6 @@ pub unsafe fn device_max_qp(ctx: *mut sys::ibv_context) -> io::Result<i32> {
     Ok(max_qp)
 }
 
-/// 替换同一条通道时不额外占 QP。满了就拒绝新连接。
 pub fn admit_passive_qp(active: usize, max_qp: i32, replacing: bool) -> bool {
     if max_qp <= 0 {
         return false;
@@ -150,7 +144,6 @@ pub fn chunk_size_error(advertised_mb: u32, chunk_bytes: usize) -> Option<&'stat
     None
 }
 
-/// 这些事件之后 QP 不会进入 ESTABLISHED，或者已经离开。调用方要把连接从映射里拿走。
 pub fn cm_event_drops_connection(event: u32) -> bool {
     matches!(
         event,
@@ -172,11 +165,6 @@ pub struct CmEventView {
     pub private_data: Option<ConnPrivateData>,
 }
 
-/// `rdma_ack_cm_event` 会释放事件和它的 private_data。必须在 ack 之前把要用的字节拷出来。
-///
-/// # Safety
-///
-/// `raw` 必须指向 `rdma_get_cm_event` 返回、尚未 ack 的事件。
 pub unsafe fn snapshot_cm_event(raw: *const sys::rdma_cm_event) -> CmEventView {
     let ev = &*raw;
     CmEventView {
@@ -358,12 +346,6 @@ pub fn sockaddr_from_v4(addr: SocketAddrV4) -> sys::sockaddr_in {
     }
 }
 
-/// IPv4 address published in this device's GID table.
-///
-/// `rdma_cm` attaches a listener to the HCA that owns the matching GID. The
-/// netdev's primary address can be absent from that table (an IPv6 GID still
-/// names the same netdev), and binding it then leaves the id on another
-/// device, or on none.
 pub fn rdma_dev_ipv4(dev_name: &str) -> Option<Ipv4Addr> {
     let port = std::path::Path::new("/sys/class/infiniband")
         .join(dev_name)

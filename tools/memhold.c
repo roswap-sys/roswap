@@ -50,33 +50,33 @@ static void prompt(void)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"用法: %s [-m 大小] [-i 秒] [-n 轮数]\n"
+		"usage: %s [-m size] [-i seconds] [-n rounds]\n"
 		"\n"
-		"持续占用一块匿名内存。每一页写入该页偏移，并定期读回校验。\n"
-		"申请量大于 MemoryMax 时，读页会把数据从 swap 换入。\n"
+		"Hold anonymous memory. Each page stores its offset and is checked on a timer.\n"
+		"When the allocation exceeds MemoryMax, a read faults the page back in from swap.\n"
 		"\n"
-		"  -m    起始大小，默认 40 MiB。例如 40、512k、1g\n"
-		"  -i    检查间隔，默认 2 秒。0 表示只在输入命令时检查\n"
-		"  -n    校验这么多轮后退出。全部通过返回 0，有一页对不上返回 1\n"
+		"  -m    initial size, default 40 MiB. Examples: 40, 512k, 1g\n"
+		"  -i    check interval, default 2 seconds. 0 checks only on command input\n"
+		"  -n    exit after this many checks. 0 if all pass, 1 if any page mismatches\n"
 		"\n"
-		"不带 -n 时一直运行。运行后输入 help 查看命令。\n",
+		"Without -n, run until quit. Enter help for commands.\n",
 		prog);
 }
 
 static void help(void)
 {
-	fputs("命令:\n"
-	      "  64          申请调整到 64 MiB\n"
-	      "  +16         增加 16 MiB\n"
-	      "  -8          减少 8 MiB\n"
-	      "  回车        立刻校验并显示状态\n"
-	      "  watch       每个间隔都打印；再输入一次关闭\n"
-	      "  quiet       只在数值变化时打印\n"
-	      "  interval 2  修改检查间隔（秒），0 为手动\n"
-	      "  help        显示本帮助\n"
-	      "  quit        释放内存并退出\n"
+	fputs("commands:\n"
+	      "  64          resize to 64 MiB\n"
+	      "  +16         add 16 MiB\n"
+	      "  -8          subtract 8 MiB\n"
+	      "  <enter>     verify now and print status\n"
+	      "  watch       print every interval; enter again to turn off\n"
+	      "  quiet       print only when values change\n"
+	      "  interval 2  set the check interval in seconds; 0 is manual\n"
+	      "  help        show this help\n"
+	      "  quit        release memory and exit\n"
 	      "\n"
-	      "大小可以写 512k、64m、1g。set / add / sub 以及 设置 / 增加 / 减少 同样可用。\n",
+	      "Sizes can be 512k, 64m, or 1g. set, add, and sub are also accepted.\n",
 	      stdout);
 }
 
@@ -132,8 +132,8 @@ static int read_vm(unsigned long *rss_kb, unsigned long *swap_kb)
 static const char *verdict(int ok)
 {
 	if (!use_color)
-		return ok ? "校验通过" : "校验失败";
-	return ok ? "\033[32m校验通过\033[0m" : "\033[31m校验失败\033[0m";
+		return ok ? "passed" : "failed";
+	return ok ? "\033[32mpassed\033[0m" : "\033[31mfailed\033[0m";
 }
 
 static void lat_reset(void)
@@ -158,7 +158,6 @@ static void lat_add(uint64_t ns)
 	lat_samples++;
 }
 
-/* ppt 是千分位：500、990、999。返回落桶的上界。 */
 static uint64_t lat_pct(unsigned ppt)
 {
 	uint64_t need, acc = 0;
@@ -204,11 +203,11 @@ static void print_status(int ok, size_t bad_off)
 	fmt_size(rss, sizeof(rss), (unsigned long long)rss_kb << 10);
 	fmt_size(sw, sizeof(sw), (unsigned long long)swap_kb << 10);
 	if (ok) {
-		printf("申请 %s | 物理 %s | 交换 %s | %s\n",
+		printf("hold %s | rss %s | swap %s | %s\n",
 		       hold, rss, sw, verdict(1));
 	} else {
 		fmt_size(off, sizeof(off), bad_off);
-		printf("申请 %s | 物理 %s | 交换 %s | %s，偏移 %s\n",
+		printf("hold %s | rss %s | swap %s | %s, offset %s\n",
 		       hold, rss, sw, verdict(0), off);
 	}
 	if (lat_samples) {
@@ -216,7 +215,7 @@ static void print_status(int ok, size_t bad_off)
 		fmt_ns(p99, sizeof(p99), lat_pct(990));
 		fmt_ns(p999, sizeof(p999), lat_pct(999));
 		fmt_ns(pmax, sizeof(pmax), lat_max_ns);
-		printf("换入 p50 %s | p99 %s | p999 %s | max %s\n",
+		printf("fault-in p50 %s | p99 %s | p999 %s | max %s\n",
 		       p50, p99, p999, pmax);
 	}
 	fflush(stdout);
@@ -350,13 +349,13 @@ static void say_resize(size_t old)
 
 	fmt_size(now, sizeof(now), mem_bytes);
 	if (mem_bytes == old) {
-		printf("大小没有变化，仍是 %s。\n", now);
+		printf("size unchanged, still %s.\n", now);
 		return;
 	}
 	fmt_size(delta, sizeof(delta),
 		 mem_bytes > old ? mem_bytes - old : old - mem_bytes);
-	printf("已调整为 %s（%s %s）。\n", now,
-	       mem_bytes > old ? "增加" : "减少", delta);
+	printf("resized to %s (%s %s).\n", now,
+	       mem_bytes > old ? "increased" : "decreased", delta);
 	fflush(stdout);
 }
 
@@ -365,7 +364,7 @@ static int apply_size(size_t bytes, int announce)
 	size_t old = mem_bytes;
 
 	if (resize(bytes) < 0) {
-		fprintf(stderr, "调整失败: %s\n", strerror(errno));
+		fprintf(stderr, "resize failed: %s\n", strerror(errno));
 		prompt();
 		return -1;
 	}
@@ -416,13 +415,13 @@ static int handle_line(char *s)
 		return do_status();
 	if (*s == '+' || (*s == '-' && isdigit((unsigned char)s[1]))) {
 		if (parse_size(s + 1, &n) < 0 || n == 0) {
-			fprintf(stderr, "大小无效。例如 +16 或 -8。\n");
+			fprintf(stderr, "invalid size. Example: +16 or -8.\n");
 			prompt();
 			return 0;
 		}
 		if (*s == '+') {
 			if (n > SIZE_MAX - mem_bytes) {
-				fprintf(stderr, "大小超出范围。\n");
+				fprintf(stderr, "size out of range.\n");
 				prompt();
 				return 0;
 			}
@@ -434,7 +433,7 @@ static int handle_line(char *s)
 	}
 	if (parse_size(s, &n) == 0) {
 		if (n == 0) {
-			fprintf(stderr, "大小要大于 0。输入 quit 退出。\n");
+			fprintf(stderr, "size must be greater than 0. Enter quit to exit.\n");
 			prompt();
 			return 0;
 		}
@@ -446,75 +445,75 @@ static int handle_line(char *s)
 	if (nr < 1)
 		return 0;
 	lower_copy(cmd, raw, sizeof(cmd));
-	if (same(cmd, "quit", "q") || !strcmp(raw, "退出"))
+	if (same(cmd, "quit", "q"))
 		return 1;
-	if (same(cmd, "help", "h") || !strcmp(cmd, "?") || !strcmp(raw, "帮助")) {
+	if (same(cmd, "help", "h") || !strcmp(cmd, "?")) {
 		help();
 		prompt();
 		return 0;
 	}
-	if (same(cmd, "status", "s") || !strcmp(raw, "状态"))
+	if (same(cmd, "status", "s"))
 		return do_status();
-	if (same(cmd, "watch", NULL) || !strcmp(raw, "监控")) {
-		if (nr >= 2 && (!strcmp(arg, "on") || !strcmp(arg, "开")))
+	if (same(cmd, "watch", NULL)) {
+		if (nr >= 2 && !strcmp(arg, "on"))
 			watch = 1;
-		else if (nr >= 2 && (!strcmp(arg, "off") || !strcmp(arg, "关")))
+		else if (nr >= 2 && !strcmp(arg, "off"))
 			watch = 0;
 		else
 			watch = !watch;
-		printf("%s\n", watch ? "每个间隔都会打印状态。" : "只在数值变化时打印。");
+		printf("%s\n", watch ? "printing status every interval." : "printing only when values change.");
 		fflush(stdout);
 		prompt();
 		return 0;
 	}
-	if (same(cmd, "quiet", NULL) || !strcmp(raw, "安静")) {
+	if (same(cmd, "quiet", NULL)) {
 		watch = 0;
-		puts("只在数值变化时打印。");
+		puts("printing only when values change.");
 		prompt();
 		return 0;
 	}
-	if (same(cmd, "interval", NULL) || !strcmp(raw, "间隔")) {
+	if (same(cmd, "interval", NULL)) {
 		double sec;
 
 		if (nr < 2) {
-			fprintf(stderr, "用法: interval 2\n");
+			fprintf(stderr, "usage: interval 2\n");
 			prompt();
 			return 0;
 		}
 		errno = 0;
 		sec = strtod(arg, &end);
 		if (errno || end == arg || *end != '\0' || sec < 0) {
-			fprintf(stderr, "间隔无效。\n");
+			fprintf(stderr, "invalid interval.\n");
 			prompt();
 			return 0;
 		}
 		interval_ms = (int)(sec * 1000);
 		if (interval_ms == 0)
-			puts("已改为手动检查，输入回车查看状态。");
+			puts("manual checks; press enter to show status.");
 		else
-			printf("检查间隔已改为 %.1f 秒。\n", sec);
+			printf("check interval set to %.1f s.\n", sec);
 		fflush(stdout);
 		prompt();
 		return 0;
 	}
 	if (nr < 2 || parse_size(arg, &n) < 0) {
-		fprintf(stderr, "无法识别。输入 help 查看命令。\n");
+		fprintf(stderr, "unrecognized. Enter help for commands.\n");
 		prompt();
 		return 0;
 	}
-	if (same(cmd, "set", NULL) || !strcmp(raw, "设置")) {
+	if (same(cmd, "set", NULL)) {
 		apply_size(n, 1);
-	} else if (same(cmd, "add", NULL) || !strcmp(raw, "增加")) {
+	} else if (same(cmd, "add", NULL)) {
 		if (n > SIZE_MAX - mem_bytes) {
-			fprintf(stderr, "大小超出范围。\n");
+			fprintf(stderr, "size out of range.\n");
 			prompt();
 			return 0;
 		}
 		apply_size(mem_bytes + n, 1);
-	} else if (same(cmd, "sub", NULL) || !strcmp(raw, "减少")) {
+	} else if (same(cmd, "sub", NULL)) {
 		apply_size(n >= mem_bytes ? 0 : mem_bytes - n, 1);
 	} else {
-		fprintf(stderr, "无法识别。输入 help 查看命令。\n");
+		fprintf(stderr, "unrecognized. Enter help for commands.\n");
 		prompt();
 	}
 	return 0;
@@ -616,8 +615,8 @@ int main(int argc, char **argv)
 	}
 
 	if (interactive && !batch_rounds) {
-		puts("memhold：持续占用内存，按页写入偏移并校验。");
-		puts("输入 help 查看命令，直接回车查看状态。");
+		puts("memhold: holding memory, writing each page offset and verifying it.");
+		puts("Enter help for commands, or press enter to show status.");
 		putchar('\n');
 	}
 
@@ -650,7 +649,7 @@ int main(int argc, char **argv)
 		int ev;
 
 		if (!stdin_alive && interval_ms <= 0) {
-			fprintf(stderr, "标准输入已关闭，退出。\n");
+			fprintf(stderr, "stdin closed, exiting.\n");
 			break;
 		}
 		ev = poll_commands(interval_ms > 0 ? interval_ms : -1);
@@ -668,6 +667,6 @@ int main(int argc, char **argv)
 
 	resize(0);
 	if (interactive)
-		puts("已释放内存。");
+		puts("memory released.");
 	return 0;
 }
