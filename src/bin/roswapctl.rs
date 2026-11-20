@@ -24,6 +24,9 @@ fn main() {
         }
     };
     if let Err(err) = result {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
         eprintln!("roswapctl: {err}");
         process::exit(1);
     }
@@ -32,7 +35,9 @@ fn main() {
 fn kernel_status() -> io::Result<()> {
     let mut genl = GenlClient::open()?;
     let stats = genl.stats()?;
-    println!(
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
         "slots {} used {} free_extents {} nodes {} chunks {} links_up {} degraded {} lost {}",
         stats.nr_slots,
         stats.used_slots,
@@ -42,14 +47,14 @@ fn kernel_status() -> io::Result<()> {
         stats.links_up,
         stats.degraded_slots,
         stats.lost_slots
-    );
+    )?;
     for node in &stats.nodes {
         let name = match node.state {
             1 => "suspect",
             2 => "dead",
             _ => "up",
         };
-        println!("node {} {}", node.id, name);
+        writeln!(out, "node {} {}", node.id, name)?;
     }
     Ok(())
 }

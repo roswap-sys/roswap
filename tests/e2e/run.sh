@@ -257,6 +257,8 @@ scenario_suspect() {
 	[[ $rc -eq 0 ]] || die "memhold failed while a replica was suspect, exit $rc"
 	[[ $(node_state 2) != dead ]] || die "a short freeze was judged dead"
 	[[ $(status_field lost) == 0 ]] || die "suspect lost pages"
+	# A direct write to an active swap device returns ETXTBSY.
+	swapoff /dev/roswap0
 	dd if=/dev/urandom of=/dev/roswap0 bs=4096 count=256 seek=256 oflag=direct \
 		conv=fsync status=none || die "write during SUSPECT failed"
 	[[ $(status_field degraded) -gt ${before:-0} ]] ||
