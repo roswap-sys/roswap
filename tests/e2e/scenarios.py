@@ -264,8 +264,11 @@ def scenario_replica2(c: Cluster) -> None:
     before = c.stats().degraded
     c.freeze(2)
     c.wait_state(2, "suspect", 2)
+    # The 80 MiB verify already owns the low offsets, and a frozen provider
+    # still serves RDMA from registered memory. A new extent is the write
+    # that has to land on the remaining node and come back short.
     subprocess.run(
-        ["dd", "if=/dev/urandom", "of=/dev/roswap0", "bs=4096", "count=256", "seek=256",
+        ["dd", "if=/dev/urandom", "of=/dev/roswap0", "bs=4096", "count=256", "seek=20480",
          "oflag=direct", "conv=fsync", "status=none"],
         check=True,
     )
