@@ -141,6 +141,7 @@ static void test_flip_versus_place(void)
 	struct rs_copies remote;
 
 	expect(rs_map_init(1) == 0, "init");
+	expect(rs_map_set_protection(RS_PROT_REPLICA2) == 0, "replica2");
 	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "nodes");
 	expect(rs_map_chunk_add(1, 0, 1, 0x100000000ULL, 1, 4) == 0, "node 1");
 	expect(rs_map_chunk_add(2, 0, 1, 0x200000000ULL, 2, 4) == 0, "node 2");
@@ -151,6 +152,7 @@ static void test_flip_versus_place(void)
 	expect(pthread_join(flip, NULL) == 0, "join flip");
 	alarm(0);
 	expect(rs_map_node_state(2) == RS_NODE_DEAD, "flip ended dead");
+	check_dead_invariant(2);
 	if (rs_map_prepare_write(100ull << 12, 4096, &remote) == 0) {
 		u32 c;
 
@@ -160,7 +162,6 @@ static void test_flip_versus_place(void)
 		}
 		rs_map_finish_write(100ull << 12, remote.mask);
 	}
-	check_dead_invariant(2);
 	rs_map_exit();
 }
 

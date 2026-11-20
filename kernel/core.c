@@ -1974,6 +1974,7 @@ static void rs_hb_work(struct work_struct *work)
 			link->hb_posted = false;
 			memset(&wire, 0, sizeof(wire));
 			if (wc.status == IB_WC_SUCCESS && link->hb_buf) {
+				/* The CQ entry publishes the RDMA READ of hb_buf. */
 				smp_rmb();
 				memcpy(&wire, link->hb_buf, sizeof(wire));
 				rs_hb_note(link, true, wire.tick, wire.boot);

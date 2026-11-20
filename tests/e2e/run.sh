@@ -216,15 +216,19 @@ wait_state_for() {
 }
 
 scenario_genl() {
-	local cargo_home=${CARGO_HOME:-$HOME/.cargo} home cargo
+	local cargo_home=${CARGO_HOME:-$HOME/.cargo} rustup_home=${RUSTUP_HOME:-}
+	local home cargo
 	load_module
 	cargo=$(command -v cargo || true)
 	if [[ -n ${SUDO_USER:-} ]]; then
 		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 		cargo_home=$home/.cargo
+		# sudo drops the caller's rustup dir, so the proxy has no toolchain.
+		[[ -z $rustup_home && -d $home/.rustup ]] && rustup_home=$home/.rustup
 		[[ -x $home/.cargo/bin/cargo ]] && cargo=$home/.cargo/bin/cargo
 	fi
 	[[ -n $cargo ]] || die "cargo is required for the netlink test"
+	[[ -n $rustup_home ]] && export RUSTUP_HOME=$rustup_home
 	CARGO_HOME=$cargo_home CARGO_TARGET_DIR=/tmp/roswap-genl-target \
 		"$cargo" test --locked --manifest-path "$ROOT/Cargo.toml" --lib \
 		kernel_rejects_illegal_netlink -- --ignored --exact --test-threads=1
