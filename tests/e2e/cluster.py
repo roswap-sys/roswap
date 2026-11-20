@@ -264,14 +264,17 @@ class Cluster:
         self.close_genl()
         if not Path("/sys/module/roswap").exists():
             return
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if subprocess.run(["rmmod", "roswap"], check=False).returncode == 0:
-                return
-            if not Path("/sys/module/roswap").exists():
-                return
+            proc = subprocess.Popen(["rmmod", "roswap"], start_new_session=True)
+            try:
+                if proc.wait(timeout=20) == 0 or not Path("/sys/module/roswap").exists():
+                    return
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise E2EError("rmmod roswap timed out after 20s")
             time.sleep(0.1)
-        subprocess.run(["rmmod", "roswap"], check=True)
+        raise E2EError("rmmod roswap timed out after 20s")
 
     def bring_up(
         self,

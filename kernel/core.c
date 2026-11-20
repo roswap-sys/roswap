@@ -124,6 +124,7 @@ struct rs_qp {
 	struct work_struct poll_work;
 	atomic_t poll_queued;
 	int send_depth;
+	int cq_depth;
 	bool cq_pool;
 	bool poll_direct;
 	u16 send_limit;
@@ -1390,7 +1391,7 @@ static void rs_free_cq(struct rs_qp *qp)
 		return;
 	if (qp->cq_pool)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-		ib_cq_pool_put(qp->cq, qp->send_depth);
+		ib_cq_pool_put(qp->cq, qp->cq_depth);
 #else
 		ib_free_cq(qp->cq);
 #endif
@@ -1469,18 +1470,20 @@ static int rs_qp_connect(struct rs_qp *qp)
 	if (qp->send_limit && qp->send_limit < qp->send_depth)
 		qp->send_depth = qp->send_limit;
 	vec = rs_comp_vector(id->device, qp->cpu);
+	/* One spare slot so teardown can post a drain WR while a send is in flight. */
+	qp->cq_depth = qp->send_depth + 1;
 	if (qp->poll_direct)
-		qp->cq = ib_alloc_cq(id->device, qp, qp->send_depth, vec,
+		qp->cq = ib_alloc_cq(id->device, qp, qp->cq_depth, vec,
 				     IB_POLL_DIRECT);
 	else
-		qp->cq = rs_alloc_bulk_cq(id->device, qp, qp->send_depth, vec,
+		qp->cq = rs_alloc_bulk_cq(id->device, qp, qp->cq_depth, vec,
 					  &qp->cq_pool);
 	if (IS_ERR(qp->cq)) {
 		ret = PTR_ERR(qp->cq);
 		qp->cq = NULL;
 		goto err_id;
 	}
-	qp_attr.cap.max_send_wr = qp->send_depth;
+	qp_attr.cap.max_send_wr = qp->cq_depth;
 	qp_attr.send_cq = qp->cq;
 	qp_attr.recv_cq = qp->cq;
 	ret = rdma_create_qp(id, qp->dev->pd, &qp_attr);
@@ -1507,13 +1510,83 @@ err_id:
 	return ret;
 }
 
+struct rs_drain_wr {
+	struct ib_cqe cqe;
+	struct completion done;
+};
+
+static void rs_drain_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct rs_drain_wr *drain = container_of(wc->wr_cqe, struct rs_drain_wr, cqe);
+
+	(void)cq;
+	complete(&drain->done);
+}
+
+/* ib_drain_qp waits uninterruptibly. A full send queue (qp_send_depth=1 with
+ * one WR posted) never accepts the drain WR, so module exit never returns.
+ */
+#define RS_QP_DRAIN_MS 2000
+
+static void rs_qp_drain(struct rs_qp *qp)
+{
+	struct ib_qp *ibqp = qp->cm_id->qp;
+	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+	struct rs_drain_wr drain = {};
+	struct ib_rdma_wr wr = {};
+	unsigned long end;
+	int ret;
+
+	if (!ibqp)
+		return;
+	ib_modify_qp(ibqp, &attr, IB_QP_STATE);
+	init_completion(&drain.done);
+	drain.cqe.done = rs_drain_cqe_done;
+	wr.wr.opcode = IB_WR_RDMA_WRITE;
+	wr.wr.wr_cqe = &drain.cqe;
+	wr.wr.send_flags = IB_SEND_SIGNALED;
+	ret = ib_post_send(ibqp, &wr.wr, NULL);
+	end = jiffies + msecs_to_jiffies(RS_QP_DRAIN_MS);
+	if (ret && atomic_read(&qp->send_used) == 0) {
+		pr_warn("qp drain post failed: %d\n", ret);
+		return;
+	}
+	if (ret)
+		pr_warn("qp drain post failed: %d\n", ret);
+	for (;;) {
+		long left = 0;
+
+		if (!ret) {
+			left = wait_for_completion_killable_timeout(&drain.done,
+							msecs_to_jiffies(100));
+			if (left != 0)
+				return;
+		}
+		if (qp->poll_direct && qp->cq)
+			ib_process_cq_direct(qp->cq, 16);
+		else if (qp->cq) {
+			struct ib_wc wc;
+
+			while (ib_poll_cq(qp->cq, 1, &wc) > 0) {
+				if (wc.wr_cqe && wc.wr_cqe->done)
+					wc.wr_cqe->done(qp->cq, &wc);
+			}
+		}
+		if (time_after(jiffies, end)) {
+			pr_warn("qp drain timed out after %d ms\n", RS_QP_DRAIN_MS);
+			return;
+		}
+		if (ret)
+			usleep_range(1000, 2000);
+	}
+}
+
 static void rs_qp_teardown(struct rs_qp *qp)
 {
 	if (!qp->cm_id)
 		return;
 	rdma_disconnect(qp->cm_id);
-	if (qp->cm_id->qp)
-		ib_drain_qp(qp->cm_id->qp);
+	rs_qp_drain(qp);
 	rdma_destroy_qp(qp->cm_id);
 	rs_free_cq(qp);
 	rdma_destroy_id(qp->cm_id);

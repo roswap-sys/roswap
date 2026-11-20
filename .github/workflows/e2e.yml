@@ -55,36 +55,47 @@ jobs:
       run: bash .github/scripts/setup-soft-roce.sh
 
     - name: Block device
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py blk
 
     - name: Swap
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py swap
 
     - name: Fault injection
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py fault
 
     - name: Module parameters
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py params
 
     - name: Reconnect under IO
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py stress
 
     - name: Illegal netlink
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py genl
 
     - name: Two replicas
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py replica2
 
     - name: Read hedge
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py hedge
 
     - name: Suspect node
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py suspect
 
     - name: Dead node
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py dead
 
     - name: Fault-detection robustness
+      timeout-minutes: 8
       run: sudo python3 tests/e2e/run.py robust
 
     - name: Collect logs
@@ -210,6 +221,7 @@ jobs:
         make -C kernel KDIR="$KDIR" CC="$CC" HOSTCC="$CC"
 
     - name: Run e2e in VM
+      timeout-minutes: 20
       run: |
         out="$GITHUB_WORKSPACE/e2e-logs"
         mkdir -p "$out"
