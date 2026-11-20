@@ -1025,7 +1025,8 @@ static void rs_chunk_free(struct rs_chunk *c)
 	if (!c)
 		return;
 	kfree(c->bm);
-	kfree(rcu_dereference(c->key));
+	/* Exit and node removal already waited for readers. */
+	kfree(rcu_dereference_protected(c->key, true));
 	kfree(c);
 }
 

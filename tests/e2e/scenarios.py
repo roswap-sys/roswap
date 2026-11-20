@@ -146,6 +146,7 @@ def scenario_genl(c: Cluster) -> None:
     client.node_add(9, "127.0.0.1:18619")
     client.node_add(9, "127.0.0.1:18619")
     _expect_errno(lambda: client.node_add(9, "127.0.0.1:18620"), 17, "address change")
+    client.node_set_state(9, 2)
     client.node_del(9)
     say("legal chunk update and retire on a connected node")
     client.chunk_add(1, 99, 1, 0x1000, 0xABC, CHUNK_MB)
@@ -259,17 +260,6 @@ def scenario_replica2(c: Cluster) -> None:
         raise E2EError("readback mismatch after a single-node drop")
     if c.node_state(1) != "up" or c.node_state(2) != "up":
         raise E2EError(f"drop changed health {c.node_state(1)} {c.node_state(2)}")
-    say("same-boot rkey change restores both copies")
-    old = _rkeys(c, 2)
-    c.stop_provider(2)
-    c.start_provider(2)
-    c.wait_kernel()
-    if _rkeys(c, 2) == old:
-        raise E2EError("node 2 rkey did not change")
-    if c.read_hash() != expect:
-        raise E2EError("readback mismatch after node 2 restart")
-    if c.node_state(2) == "dead":
-        raise E2EError("same-boot replica restart was judged dead")
     say("a write while one node is suspect is short")
     before = c.stats().degraded
     c.freeze(2)
@@ -283,6 +273,17 @@ def scenario_replica2(c: Cluster) -> None:
         raise E2EError("extents placed while a node was suspect were not marked short")
     c.thaw(2)
     c.wait_state(2, "up", 30)
+    say("same-boot rkey change restores both copies")
+    old = _rkeys(c, 2)
+    c.stop_provider(2)
+    c.start_provider(2)
+    c.wait_kernel()
+    if _rkeys(c, 2) == old:
+        raise E2EError("node 2 rkey did not change")
+    if c.read_hash() != expect:
+        raise E2EError("readback mismatch after node 2 restart")
+    if c.node_state(2) == "dead":
+        raise E2EError("same-boot replica restart was judged dead")
     say("replica2 passed")
 
 
@@ -333,14 +334,22 @@ def scenario_dead(c: Cluster) -> None:
     c.bring_up(providers=2, protection="replica2", dead_after=10)
     say("killing one replica")
     expect = c.write_pattern()
-    c.kill_provider(2)
-    c.wait_state(2, "dead", 20)
-    if c.read_hash() != expect:
-        raise E2EError("replica2 readback mismatch after a dead node")
-    if c.stats().lost != 0:
-        raise E2EError(f"replica2 lost pages ({c.stats().lost})")
-    say("boot id change retires the old epoch and the survivor still reads")
-    _boot_restart(c, expect)
+    events, stop, thread, watcher = _watch_node(2)
+    try:
+        c.kill_provider(2)
+        c.wait_state(2, "dead", 20)
+        if c.read_hash() != expect:
+            raise E2EError("replica2 readback mismatch after a dead node")
+        if c.stats().lost != 0:
+            raise E2EError(f"replica2 lost pages ({c.stats().lost})")
+        say("boot id change retires the old epoch and the survivor still reads")
+        _boot_restart(c, expect)
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        watcher.close()
+    if not events:
+        raise E2EError("kernel did not emit EVT_NODE_STATE for the dead replica")
 
     say("single provider death returns EIO and SIGBUS")
     c.stop_stack()
@@ -467,22 +476,26 @@ def _legacy_server(c: Cluster) -> None:
     c.stop_provider(1)
 
 
-def _boot_restart(c: Cluster, expect: str) -> None:
+def _watch_node(node_id: int):
     events: list = []
+    stop = threading.Event()
     watcher = GenlEvents()
 
     def collect() -> None:
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
+        while not stop.is_set():
             try:
                 ev = watcher.poll(200)
             except OSError:
-                return
-            if ev is not None and ev.cmd == RS_EVT_NODE_STATE and ev.node_id == 2:
+                continue
+            if ev is not None and ev.cmd == RS_EVT_NODE_STATE and ev.node_id == node_id:
                 events.append(ev)
 
     thread = threading.Thread(target=collect, daemon=True)
     thread.start()
+    return events, stop, thread, watcher
+
+
+def _boot_restart(c: Cluster, expect: str) -> None:
     c.kill_provider(2)
     time.sleep(0.2)
     c.stop_provider(2)
@@ -499,12 +512,8 @@ def _boot_restart(c: Cluster, expect: str) -> None:
             ready = True
             break
         time.sleep(0.2)
-    thread.join(timeout=1)
-    watcher.close()
     if not ready:
         raise E2EError("provider 2 did not rejoin with the new boot id and epoch")
-    if not events:
-        raise E2EError("kernel did not emit EVT_NODE_STATE for the boot change")
     if c.read_hash() != expect:
         raise E2EError("readback mismatch after a boot_id change")
     if c.stats().lost != 0:

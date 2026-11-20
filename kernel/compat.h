@@ -24,6 +24,7 @@ static inline struct gendisk *roswap_alloc_disk(struct blk_mq_tag_set *set)
 		.max_hw_sectors = PAGE_SIZE >> SECTOR_SHIFT,
 		.max_segments = 1,
 		.dma_alignment = PAGE_SIZE - 1,
+		.max_hw_discard_sectors = (1U << 20) >> SECTOR_SHIFT,
 		.max_discard_sectors = (1U << 20) >> SECTOR_SHIFT,
 		.discard_granularity = 1U << 20,
 	};
