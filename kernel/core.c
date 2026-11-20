@@ -192,6 +192,9 @@ struct rs_bounce {
 	struct roswap_cmd *cmd;
 	unsigned int bit;
 	unsigned int cpu;
+	u32 seq;
+	u32 gid;
+	u32 gen;
 	u8 which;
 	atomic_t live;
 };
@@ -204,7 +207,9 @@ struct roswap_cmd {
 	struct page *user_page;
 	struct ib_device *dev;
 	bool *done_flag;
+	bool poll_done;
 	atomic_t copy_word;
+	u32 seq;
 	u64 dma;
 	u64 off;
 	u32 len;
@@ -636,18 +641,42 @@ static void rs_done_work(struct work_struct *work)
 	rs_bounce_free(bounce, false);
 }
 
-static bool rs_settle(struct roswap_cmd *cmd, u32 which, bool success, bool posted)
+#define RS_COPY_SEQ_SHIFT	10
+#define RS_COPY_SEQ_MASK	0xfffffu
+
+static u32 rs_copy_seq(u32 word)
 {
+	return (word >> RS_COPY_SEQ_SHIFT) & RS_COPY_SEQ_MASK;
+}
+
+static void rs_note_done(struct roswap_cmd *cmd)
+{
+	bool *flag = READ_ONCE(cmd->done_flag);
+
+	if (flag)
+		WRITE_ONCE(*flag, true);
+}
+
+/*
+ * A hedge loser completes after its request has ended and the tag may
+ * already carry a new IO. @bounce is set for bounce completions, which
+ * only apply while the copy word still carries the sequence they were
+ * posted under; -ESTALE means @cmd was not touched.
+ */
+static int rs_settle(struct roswap_cmd *cmd, u32 which, bool success, bool posted,
+		     struct rs_bounce *bounce)
+{
+	struct rs_qp *qp = bounce ? bounce->qp : cmd->qp[which];
 	u32 old, new;
 
-	if (cmd->done_flag)
-		*cmd->done_flag = true;
-	if (cmd->dir == DMA_FROM_DEVICE) {
+	if (bounce || cmd->dir == DMA_FROM_DEVICE) {
 		int act = RS_ACT_WAIT;
 		bool took = false;
 
 		do {
 			old = (u32)atomic_read(&cmd->copy_word);
+			if (bounce && rs_copy_seq(old) != bounce->seq)
+				return -ESTALE;
 			act = rs_read_arrive(old, which, success, &new);
 			if (new == old)
 				break;
@@ -657,39 +686,44 @@ static bool rs_settle(struct roswap_cmd *cmd, u32 which, bool success, bool post
 				break;
 			}
 		} while (1);
+		rs_note_done(cmd);
 		if (posted && (took || (old & RS_COPY_FINISH)))
-			rs_credit_put(cmd->qp[which]);
+			rs_credit_put(qp);
+		if (!took)
+			return RS_ACT_WAIT;
 		if (cmd->use_bounce &&
 		    (act == RS_ACT_PUBLISH || act == RS_ACT_FAIL)) {
 			if (act == RS_ACT_PUBLISH) {
-				WRITE_ONCE(cmd->publish_bounce, cmd->bounce[which]);
+				WRITE_ONCE(cmd->publish_bounce,
+					   bounce ? bounce : cmd->bounce[which]);
 				if (which == cmd->hedge_which)
 					atomic_inc(&rs_hedge_won);
 			} else {
 				WRITE_ONCE(cmd->publish_bounce, NULL);
 			}
 			queue_work(roswap_io, &cmd->done_work);
-			return true;
+			return act;
 		}
 		if (act == RS_ACT_PUBLISH || act == RS_ACT_FAIL)
 			rs_finish_now(cmd);
-		return true;
+		return act;
 	}
+	rs_note_done(cmd);
 	do {
 		old = (u32)atomic_read(&cmd->copy_word);
 		new = rs_copy_note(old, which, success);
 		if (new == old)
-			return false;
+			return RS_ACT_WAIT;
 	} while ((u32)atomic_cmpxchg(&cmd->copy_word, (int)old, (int)new) != old);
 	if (posted)
-		rs_credit_put(cmd->qp[which]);
+		rs_credit_put(qp);
 	do {
 		old = (u32)atomic_read(&cmd->copy_word);
 		if (!rs_copy_claim_finish(old, &new))
-			return true;
+			return RS_ACT_WAIT;
 	} while ((u32)atomic_cmpxchg(&cmd->copy_word, (int)old, (int)new) != old);
 	rs_finish_cmd(cmd);
-	return true;
+	return RS_ACT_PUBLISH;
 }
 
 static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -711,7 +745,7 @@ static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
 		}
 		rs_link_failed(qp ? qp->link : NULL);
 	}
-	rs_settle(cmd, wr->which, ok, true);
+	rs_settle(cmd, wr->which, ok, true, NULL);
 }
 
 static u8 rs_pick_hedge(const struct rs_pick *pick, u8 post, bool read)
@@ -793,6 +827,7 @@ static void rs_bounce_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct rs_bounce *bounce = container_of(wc->wr_cqe, struct rs_bounce, cqe);
 	struct roswap_cmd *cmd = READ_ONCE(bounce->cmd);
 	bool ok = wc->status == IB_WC_SUCCESS;
+	int act;
 
 	(void)cq;
 	if (!cmd) {
@@ -801,17 +836,17 @@ static void rs_bounce_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 	if (!ok && wc->status != IB_WC_WR_FLUSH_ERR && bounce->qp) {
 		if (rs_wc_permanent(wc->status) &&
-		    rs_map_chunk_gen(cmd->gid[bounce->which]) ==
-		    cmd->gen[bounce->which]) {
+		    rs_map_chunk_gen(bounce->gid) == bounce->gen) {
 			WRITE_ONCE(bounce->qp->link->key_wait, true);
 			atomic_inc(&rs_key_wait_hits);
 		}
 		rs_link_failed(bounce->qp->link);
 	}
-	rs_settle(cmd, bounce->which, ok, true);
-	if (READ_ONCE(cmd->publish_bounce) == bounce)
+	act = rs_settle(cmd, bounce->which, ok, true, bounce);
+	/* A published bounce belongs to done_work, which may already have freed it. */
+	if (act == RS_ACT_PUBLISH)
 		return;
-	rs_bounce_free(bounce, false);
+	rs_bounce_free(bounce, act == -ESTALE);
 }
 
 static int rs_post_send(struct rs_qp *qp, struct ib_send_wr *wr)
@@ -828,6 +863,8 @@ static int rs_post_send(struct rs_qp *qp, struct ib_send_wr *wr)
 		return -ENODEV;
 	}
 	if (rs_credit_get(qp)) {
+		/* A hedge loser can hold the last credit on a CQ nobody is polling. */
+		rs_queue_poll(qp);
 		rcu_read_unlock();
 		return -EAGAIN;
 	}
@@ -856,6 +893,9 @@ static int rs_post_bounce(struct roswap_cmd *cmd, u32 which, u64 remote,
 		return -ENOMEM;
 	dev = qp->dev->ibdev;
 	bounce->which = (u8)which;
+	bounce->seq = cmd->seq;
+	bounce->gid = cmd->gid[which];
+	bounce->gen = cmd->gen[which];
 	bounce->qp = qp;
 	bounce->cmd = cmd;
 	cmd->bounce[which] = bounce;
@@ -930,7 +970,7 @@ static void rs_hedge_work(struct work_struct *work)
 		set = cmd->qp[which]->set;
 	if (rs_post_bounce(cmd, which, cmd->hedge_addr, cmd->hedge_rkey,
 			   cmd->qp[which], set))
-		rs_settle(cmd, which, false, false);
+		rs_settle(cmd, which, false, false, NULL);
 	else
 		atomic_inc(&rs_hedge_sent);
 }
@@ -970,7 +1010,6 @@ static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
 {
 	struct ib_device *dev = NULL;
 	struct rs_dev *rsdev = NULL;
-	bool done = false;
 	u32 i;
 	int nposted = 0;
 	u8 hedge;
@@ -992,6 +1031,8 @@ static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
 	cmd->dir = read ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
 	cmd->sent_mask = ready;
 	cmd->done_flag = NULL;
+	cmd->poll_done = false;
+	cmd->seq = (cmd->seq + 1) & RS_COPY_SEQ_MASK;
 	cmd->hedge_which = RS_NR_COPIES;
 	cmd->use_bounce = 0;
 	cmd->dma_mapped = 0;
@@ -1000,7 +1041,7 @@ static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
 	cmd->bounce[1] = NULL;
 	WRITE_ONCE(cmd->hedge_armed, 0);
 	{
-		u32 sent_word = 0;
+		u32 sent_word = cmd->seq << RS_COPY_SEQ_SHIFT;
 
 		hedge = rs_pick_hedge(pick, ready, read);
 		for (i = 0; i < RS_NR_COPIES; i++) {
@@ -1035,7 +1076,7 @@ static blk_status_t rs_post_copies(struct request *rq, struct roswap_cmd *cmd,
 		cmd->user_page = bv->bv_page;
 		cmd->user_off = bv->bv_offset;
 		cmd->use_bounce = 1;
-		cmd->done_flag = &done;
+		cmd->done_flag = &cmd->poll_done;
 		blk_mq_start_request(rq);
 		if (rs_post_bounce(cmd, primary, copies->r[primary].addr,
 				   copies->r[primary].rkey, pick[primary].qp,
@@ -1074,7 +1115,7 @@ direct:
 			sge.lkey = qp->dev->pd->local_dma_lkey;
 			cmd->wr[i].cqe.done = rs_rdma_done;
 			if (read && qp->poll_direct)
-				cmd->done_flag = &done;
+				cmd->done_flag = &cmd->poll_done;
 			wr.wr.opcode = read ? IB_WR_RDMA_READ : IB_WR_RDMA_WRITE;
 			wr.wr.wr_cqe = &cmd->wr[i].cqe;
 			wr.wr.sg_list = &sge;
@@ -1096,13 +1137,13 @@ direct:
 				blk_mq_requeue_request(rq, true);
 				return BLK_STS_OK;
 			}
-			rs_settle(cmd, i, false, false);
+			rs_settle(cmd, i, false, false, NULL);
 			return BLK_STS_OK;
 		}
 		nposted++;
 		if (read && qp->poll_direct) {
 			rcu_read_lock();
-			rs_fault_poll(qp, cmd, &done);
+			rs_fault_poll(qp, cmd, &cmd->poll_done);
 			rcu_read_unlock();
 		}
 	}
@@ -1153,8 +1194,12 @@ static blk_status_t rs_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 	if (ret == -EBUSY || ret == -ENOMEM)
 		return BLK_STS_RESOURCE;
-	if (ret == -ENOSPC)
-		return BLK_STS_NOSPC;
+	if (ret == -ENOSPC) {
+		/* 5.10 blk-mq dispatch turns a queue_rq error into BLK_STS_IOERR. */
+		blk_mq_start_request(rq);
+		blk_mq_end_request(rq, BLK_STS_NOSPC);
+		return BLK_STS_OK;
+	}
 	if (ret)
 		return BLK_STS_IOERR;
 	rs_classify(&copies, read, set, pick, &retry);
@@ -2755,7 +2800,8 @@ static int __init roswap_init(void)
 	ret = rs_build_sets();
 	if (ret)
 		goto err_map;
-	roswap_io = alloc_workqueue("roswap_io", WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+	roswap_io = alloc_workqueue("roswap_io",
+				    WQ_PERCPU | WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
 	roswap_cm = alloc_workqueue("roswap_cm",
 				    WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!roswap_io || !roswap_cm) {

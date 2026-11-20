@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+/* core.c keeps a per-request sequence in bits 10..29 of the copy word. */
+#define RS_TEST_SEQ	(0xfffffu << 10)
+
 static int failures;
 
 static void expect(int cond, const char *what)
@@ -73,7 +76,7 @@ static void run_once(int ok0, int ok1)
 
 	race.success[0] = ok0;
 	race.success[1] = ok1;
-	word = rs_copy_mark_sent(rs_copy_mark_sent(0, 0), 1);
+	word = rs_copy_mark_sent(rs_copy_mark_sent(RS_TEST_SEQ, 0), 1);
 	atomic_store(&race.word, word);
 	if (pthread_create(&t0, NULL, lane_thread, &lane0) ||
 	    pthread_create(&t1, NULL, lane_thread, &lane1)) {
@@ -90,6 +93,8 @@ static void run_once(int ok0, int ok1)
 		expect(atomic_load(&race.fails) == 1, "one fail");
 	}
 	expect(atomic_load(&race.word) & RS_COPY_FINISH, "word is closed");
+	expect((atomic_load(&race.word) & RS_TEST_SEQ) == RS_TEST_SEQ,
+	       "request sequence bits survive");
 }
 
 int main(void)

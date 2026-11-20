@@ -5,7 +5,12 @@
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #include <net/netlink.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+#define WQ_PERCPU 0
+#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 #define nla_strscpy(dst, nla, size) ((ssize_t)nla_strlcpy(dst, nla, size))
