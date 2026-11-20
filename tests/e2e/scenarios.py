@@ -178,12 +178,18 @@ def scenario_fault(c: Cluster) -> None:
     before_wait = c.stats().key_wait
     old = _rkeys(c, 1)
     _busy_read(c)
+    # A live controller publishes the new rkey before the next read is
+    # posted, so the access error never occurs. Hold it until a read has
+    # used the stale rkey against the new memory region.
+    c._stop_key("controller")
+    wait_until("controller port free", 10, lambda: not port_listening(CTRL_PORT))
     c.kill_provider(1)
     c.stop_provider(1)
     c.start_provider(1)
-    wait_key = time.monotonic() + 20
-    while c.stats().key_wait <= before_wait and time.monotonic() < wait_key:
+    deadline = time.monotonic() + 15
+    while c.stats().key_wait <= before_wait and time.monotonic() < deadline:
         time.sleep(0.2)
+    c.start_controller()
     c.stop_io()
     c.wait_kernel()
     if c.stats().key_wait <= before_wait:
