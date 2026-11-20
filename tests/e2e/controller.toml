@@ -2,3 +2,4 @@ role = "controller"
 
 [controller]
 listen_addr = "127.0.0.1:12321"
+dead_after_s = 30

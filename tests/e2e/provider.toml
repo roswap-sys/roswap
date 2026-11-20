@@ -2,11 +2,11 @@ role = "provider"
 
 [provider]
 device_name = "@RDMA_DEV@"
-listen_addr = "@RDMA_IP@:18615"
-grpc_addr = "127.0.0.1:12320"
-mem_dir = "/dev/shm/roswap-e2e"
+listen_addr = "@RDMA_IP@:@RDMA_PORT@"
+grpc_addr = "127.0.0.1:@GRPC_PORT@"
+mem_dir = "@MEM_DIR@"
 chunk_size_mb = 64
 num_chunks = 2
 node_epoch = 1
-node_id = 1
+node_id = @NODE_ID@
 controller_addr = "127.0.0.1:12321"

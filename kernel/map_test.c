@@ -642,6 +642,160 @@ static void test_concurrent_map(void)
 	rs_map_test_set_cpu(0);
 }
 
+static void test_hb_step(void)
+{
+	struct rs_hb_view v;
+
+	rs_hb_step(RS_NODE_UP, 0, 10, 0, 1, 1, false, 3, &v);
+	expect(v.state == RS_NODE_UP && v.misses == 1 && !v.boot_changed, "first miss");
+	rs_hb_step(RS_NODE_UP, 2, 10, 10, 1, 1, true, 3, &v);
+	expect(v.state == RS_NODE_SUSPECT && v.misses == 3, "third stale tick");
+	rs_hb_step(RS_NODE_UP, 0, 10, 10, 1, 1, true, 3, &v);
+	expect(v.misses == 1 && v.state == RS_NODE_UP, "one stale tick is not suspect");
+	rs_hb_step(RS_NODE_SUSPECT, 9, ~0ull, 0, 1, 1, true, 3, &v);
+	expect(v.state == RS_NODE_UP && !v.boot_changed && v.tick == 0, "u64 wrap stays live");
+	rs_hb_step(RS_NODE_UP, 0, 100, 50, 7, 7, true, 3, &v);
+	expect(v.boot_changed && v.state == RS_NODE_SUSPECT && v.tick == 50, "tick rollback");
+	rs_hb_step(RS_NODE_SUSPECT, 4, 100, 50000, 7, 7, true, 3, &v);
+	expect(v.state == RS_NODE_UP && v.misses == 0 && !v.boot_changed, "forward jump recovers");
+	rs_hb_step(RS_NODE_UP, 0, 5, 9, 1, 2, true, 3, &v);
+	expect(v.boot_changed && v.state == RS_NODE_SUSPECT, "boot id change");
+	rs_hb_step(RS_NODE_UP, 0, 0, 4, 0, 9, true, 0, &v);
+	expect(v.state == RS_NODE_UP && v.tick == 4 && !v.boot_changed, "first sample accepts boot");
+}
+
+static u16 placed_nodes(u32 n, u32 mode)
+{
+	struct rs_copies remote;
+	u32 i;
+	u16 saw = 0;
+
+	expect(rs_map_set_protection(mode) == 0, "protection");
+	for (i = 0; i < n; i++) {
+		u32 c;
+
+		if (rs_map_prepare_write((u64)i << 12, 4096, &remote))
+			break;
+		for (c = 0; c < RS_NR_COPIES; c++) {
+			if (remote.mask & (1u << c))
+				saw |= (u16)(1u << remote.r[c].node_id);
+		}
+		rs_map_finish_write((u64)i << 12, remote.mask);
+	}
+	return saw;
+}
+
+static void test_node_health(void)
+{
+	struct rs_copies remote;
+	struct rs_map_stats st;
+	struct rs_node_info info[8];
+	u32 lost = 99;
+	const u64 base0 = 0x300000000ULL;
+	const u64 base1 = 0x400000000ULL;
+	int n, i;
+
+	reset_map(4);
+	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "two nodes");
+	expect(rs_map_chunk_add(1, 0, 1, base0, 1, 4) == 0, "node 1 chunk");
+	expect(rs_map_chunk_add(2, 0, 1, base1, 2, 4) == 0, "node 2 chunk");
+	expect(rs_map_node_set_state(2, RS_NODE_SUSPECT) == 1, "node 2 becomes suspect");
+	expect(rs_map_node_set_state(2, RS_NODE_SUSPECT) == 0, "suspect twice is idle");
+	expect(placed_nodes(4, RS_PROT_SINGLE) == (1u << 1), "suspect node is skipped");
+
+	reset_map(2);
+	expect(rs_map_node_add(1) == 0, "only node");
+	expect(rs_map_chunk_add(1, 0, 1, base0, 1, 1) == 0, "one extent");
+	expect(rs_map_node_set_state(1, RS_NODE_SUSPECT) == 1, "the only node is suspect");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "a lone suspect node still places");
+	expect(remote.r[0].node_id == 1, "placed on the suspect node");
+	rs_map_finish_write(0, remote.mask);
+
+	reset_map(2);
+	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "both nodes");
+	expect(rs_map_chunk_add(1, 0, 1, base0, 1, 1) == 0, "chunk 1");
+	expect(rs_map_chunk_add(2, 0, 1, base1, 2, 1) == 0, "chunk 2");
+	expect(rs_map_node_set_state(1, RS_NODE_SUSPECT) == 1, "node 1 suspect");
+	expect(rs_map_node_set_state(2, RS_NODE_SUSPECT) == 1, "node 2 suspect");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "all-suspect placement still succeeds");
+	rs_map_finish_write(0, remote.mask);
+	expect(rs_map_node_kill(1, &lost) == 0, "kill node 1");
+	expect(rs_map_node_kill(2, &lost) == 0, "kill node 2");
+	expect(rs_map_prepare_write(4096, 4096, &remote) == -ENOSPC, "dead nodes are not placed");
+
+	reset_map(2);
+	expect(rs_map_set_protection(RS_PROT_REPLICA2) == 0, "replica2");
+	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "pair");
+	expect(rs_map_chunk_add(1, 0, 1, base0, 11, 1) == 0, "copy node 1");
+	expect(rs_map_chunk_add(2, 0, 1, base1, 22, 1) == 0, "copy node 2");
+	u16 dead_id, live_id;
+
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "bind both");
+	expect(remote.mask == 0x3, "two copies");
+	dead_id = remote.r[1].node_id;
+	live_id = remote.r[0].node_id;
+	commit(0, &remote);
+	expect(rs_map_node_kill(dead_id, &lost) == 0, "kill copy 1");
+	expect(lost == 0, "one live copy is not lost");
+	rs_map_stats(&st);
+	expect(st.degraded_slots == 1 && st.lost_slots == 0, "the page is short");
+	expect(rs_map_lookup_read(0, 4096, &remote) == 0, "read the survivor");
+	expect(remote.mask == 0x1 && remote.r[0].node_id == live_id, "the dead copy is gone");
+	rs_map_finish(0);
+	lost = 7;
+	expect(rs_map_node_kill(dead_id, &lost) == 0, "kill the same node again");
+	expect(lost == 0, "a repeated kill does not recount");
+	expect(rs_map_node_kill(live_id, &lost) == 0 && lost == 1, "the last copy is lost");
+	rs_map_stats(&st);
+	expect(st.lost_slots == 1 && st.degraded_slots == 0, "no copy left is lost, not short");
+	expect(rs_map_lookup_read(0, 4096, &remote) == -EIO, "lost page fails the read");
+	expect(rs_map_discard(0, 4096) == 0, "discard the lost page");
+	rs_map_stats(&st);
+	expect(st.lost_slots == 0 && st.used_slots == 0, "discard drops the lost count");
+
+	reset_map(1);
+	expect(rs_map_node_add(4) == 0, "node 4");
+	expect(rs_map_chunk_add(4, 3, 1, base0, 9, 1) == 0, "its chunk");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "in flight write");
+	expect(rs_map_node_kill(4, &lost) == 0 && lost == 1, "kill while the write is busy");
+	rs_map_finish_write(0, remote.mask);
+	rs_map_stats(&st);
+	expect(st.lost_slots == 1, "the late completion does not restore the dead copy");
+	expect(rs_map_lookup_read(0, 4096, &remote) == -EIO, "busy-then-dead stays lost");
+	expect(rs_map_node_set_state(4, RS_NODE_UP) == -EBUSY, "dead does not go back to up");
+
+	reset_map(1);
+	expect(rs_map_node_add(4) == 0, "node");
+	expect(rs_map_chunk_add(4, 0, 1, base0, 1, 1) == 0, "chunk");
+	expect(rs_map_chunk_add(4, 1, 1, base0 + (1ull << 20), 2, 1) == 0, "second chunk");
+	expect(rs_map_chunk_retire(4, 0) == 0, "retire the first chunk");
+	expect(rs_map_chunk_retire(4, 0) == 0, "retire again");
+	expect(rs_map_chunk_retire(4, 9) == -ENOENT, "unknown chunk");
+	expect(rs_map_prepare_write(0, 4096, &remote) == 0, "the other chunk still places");
+	expect(remote.r[0].rkey == 2, "retired chunk was not used");
+	rs_map_finish_write(0, remote.mask);
+	expect(rs_map_node_del(4) == -EBUSY, "a live node cannot be removed");
+	expect(rs_map_node_kill(4, &lost) == 0, "kill before delete");
+	expect(rs_map_discard(0, 4096) == 0, "drop the page");
+	expect(rs_map_node_del(4) == 0, "dead node with no locs can go");
+	expect(rs_map_node_state(4) == RS_NODE_DEAD, "a removed node reads as dead");
+	expect(rs_map_node_del(4) == -ENOENT, "delete is not repeatable");
+	expect(rs_map_chunk_retire(4, 1) == -ENOENT, "its chunks went with it");
+
+	reset_map(1);
+	for (i = 0; i < RS_MAX_NODES; i++)
+		expect(rs_map_node_add((u16)i) == 0, "fill every node slot");
+	expect(rs_map_node_set_state(RS_MAX_NODES - 1, RS_NODE_SUSPECT) == 1, "last slot");
+	expect(rs_map_node_state(RS_MAX_NODES - 1) == RS_NODE_SUSPECT, "last slot stuck");
+	n = rs_map_node_list(info, 0);
+	expect(n == RS_MAX_NODES, "list counts a full table");
+	n = rs_map_node_list(info, 8);
+	expect(n == RS_MAX_NODES && info[0].id == 0, "list keeps the total when capped");
+	expect(rs_map_node_set_state(40000, RS_NODE_UP) == -ENOENT, "unknown node");
+	expect(rs_map_node_kill(40000, &lost) == -ENOENT, "kill unknown");
+	expect(rs_map_node_set_state(0, 9) == -EINVAL, "bad state");
+}
+
 int main(void)
 {
 	test_copy_word();
@@ -656,6 +810,8 @@ int main(void)
 	test_same_local_gid();
 	test_steal_reserve();
 	test_concurrent_map();
+	test_hb_step();
+	test_node_health();
 	rs_map_exit();
 	if (failures) {
 		fprintf(stderr, "%d failures\n", failures);

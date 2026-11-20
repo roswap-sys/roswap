@@ -49,6 +49,28 @@ struct rs_copies {
 	struct rs_remote r[RS_NR_COPIES];
 };
 
+enum {
+	RS_NODE_UP = 0,
+	RS_NODE_SUSPECT = 1,
+	RS_NODE_DEAD = 2,
+};
+
+#define RS_HB_MISS_LIMIT	3
+#define RS_HB_TICK_JUMP		10000ull
+
+struct rs_hb_view {
+	u32 state;
+	u32 misses;
+	u64 tick;
+	bool boot_changed;
+};
+
+struct rs_node_info {
+	u16 id;
+	u8 state;
+	u8 pad;
+};
+
 struct rs_map_stats {
 	u32 nr_slots;
 	u32 used_slots;
@@ -56,11 +78,20 @@ struct rs_map_stats {
 	u32 nr_nodes;
 	u32 nr_chunks;
 	u32 degraded_slots;
+	u32 lost_slots;
 };
 
 int rs_map_init(u32 capacity_mb);
 void rs_map_exit(void);
 int rs_map_node_add(u16 node_id);
+int rs_map_node_set_state(u16 node_id, u32 state);
+int rs_map_node_kill(u16 node_id, u32 *lost_new);
+int rs_map_node_del(u16 node_id);
+u32 rs_map_node_state(u16 node_id);
+int rs_map_node_list(struct rs_node_info *out, u32 cap);
+int rs_map_chunk_retire(u16 node_id, u32 local_gid);
+void rs_hb_step(u32 state, u32 misses, u64 prev_tick, u64 tick, u64 expect_boot,
+		u64 boot, bool completed, u32 miss_limit, struct rs_hb_view *out);
 int rs_map_chunk_add(u16 node_id, u32 local_gid, u32 epoch, u64 raddr, u32 rkey,
 		     u32 chunk_mb);
 int rs_map_chunk_update(u16 node_id, u32 local_gid, u32 epoch, u64 raddr,

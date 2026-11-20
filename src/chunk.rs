@@ -234,6 +234,10 @@ impl HeartbeatPage {
     pub fn rkey(&self) -> u32 {
         unsafe { self.mr.as_ref().rkey }
     }
+
+    pub fn boot_id_lo(&self) -> u64 {
+        unsafe { self.ptr.as_ref().boot_id_lo }
+    }
 }
 
 impl Drop for HeartbeatPage {

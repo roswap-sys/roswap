@@ -32,6 +32,9 @@ message JoinRequest {
   uint32 node_id = 1;
   uint32 node_epoch = 2;
   string listen_addr = 3;
+  uint64 hb_raddr = 4;
+  uint32 hb_rkey = 5;
+  uint64 boot_id_lo = 6;
 }
 
 message JoinResponse {}
@@ -50,6 +53,9 @@ message HeartbeatRequest {
   uint32 node_epoch = 2;
   string listen_addr = 3;
   repeated ChunkDesc chunks = 4;
+  uint64 hb_raddr = 5;
+  uint32 hb_rkey = 6;
+  uint64 boot_id_lo = 7;
 }
 
 message HeartbeatResponse {}
@@ -62,6 +68,8 @@ message NodeView {
   string listen_addr = 3;
   repeated ChunkDesc chunks = 4;
   bool kernel_synced = 5;
+  uint32 node_state = 6;
+  uint64 boot_id_lo = 7;
 }
 
 message GetClusterResponse {

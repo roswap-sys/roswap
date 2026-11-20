@@ -69,6 +69,18 @@ jobs:
     - name: Reconnect under IO
       run: sudo tests/e2e/run.sh stress
 
+    - name: Illegal netlink
+      run: sudo tests/e2e/run.sh genl
+
+    - name: Suspect node
+      run: sudo tests/e2e/run.sh suspect
+
+    - name: Dead node
+      run: sudo tests/e2e/run.sh dead
+
+    - name: Fault-detection robustness
+      run: sudo tests/e2e/run.sh robust
+
     - name: Collect logs
       if: failure()
       run: |

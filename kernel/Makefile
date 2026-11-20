@@ -26,8 +26,11 @@ map-test:
 	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
 		$(CURDIR)/hedge_race_test.c -o /tmp/roswap-hedge-race
 	/tmp/roswap-hedge-race
+	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
+		$(CURDIR)/dead_race_test.c -o /tmp/roswap-dead-race
+	/tmp/roswap-dead-race
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
-	rm -f /tmp/roswap-map-test /tmp/roswap-hedge-race
+	rm -f /tmp/roswap-map-test /tmp/roswap-hedge-race /tmp/roswap-dead-race
 endif

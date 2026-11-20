@@ -105,7 +105,7 @@ rkey_bumped() {
 }
 
 scenario_fault() {
-	local expect got before after old_rkey after_rkey
+	local expect got before after old_rkey after_rkey boot_before boot_after
 	bring_up
 	say "writing baseline data"
 	expect=$(write_pattern)
@@ -124,6 +124,7 @@ scenario_fault() {
 	[[ $expect == "$got" ]] || die "readback mismatch after reconnect"
 
 	say "restarting provider, waiting for a new rkey"
+	boot_before=$(node_boot 1)
 	old_rkey=$(cluster_rkey)
 	[[ -n $old_rkey ]] || die "no rkey before restart"
 	RKEY_BEFORE=$(dmesg_count "rkey updated")
@@ -136,9 +137,13 @@ scenario_fault() {
 	wait_for "CHUNK_UPDATE" 30 rkey_bumped
 	wait_kernel
 	after_rkey=$(cluster_rkey)
+	boot_after=$(node_boot 1)
 	[[ -n $after_rkey && $after_rkey != "$old_rkey" ]] || die "rkey was not updated ($old_rkey -> ${after_rkey:-empty})"
 	got=$(read_hash)
 	[[ $expect == "$got" ]] || die "readback mismatch after provider restart"
+	[[ $(node_state 1) != dead ]] || die "same-boot restart was judged dead"
+	[[ -n $boot_before && $boot_before == "$boot_after" ]] ||
+		die "boot id changed across a same-boot restart ($boot_before -> ${boot_after:-empty})"
 	say "fault passed"
 }
 
@@ -200,17 +205,169 @@ provider_port_free() {
 	! port_listening "$E2E_GRPC_PORT"
 }
 
+wait_state_for() {
+	local id=$1 want=$2 tenths=$3 i
+	for ((i = 0; i < tenths; i++)); do
+		[[ $(node_state "$id") == "$want" ]] && return 0
+		sleep 0.1
+	done
+	node_state "$id" >&2 || true
+	return 1
+}
+
+scenario_genl() {
+	local cargo_home=${CARGO_HOME:-$HOME/.cargo} home cargo
+	load_module
+	cargo=$(command -v cargo || true)
+	if [[ -n ${SUDO_USER:-} ]]; then
+		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+		cargo_home=$home/.cargo
+		[[ -x $home/.cargo/bin/cargo ]] && cargo=$home/.cargo/bin/cargo
+	fi
+	[[ -n $cargo ]] || die "cargo is required for the netlink test"
+	CARGO_HOME=$cargo_home CARGO_TARGET_DIR=/tmp/roswap-genl-target \
+		"$cargo" test --locked --manifest-path "$ROOT/Cargo.toml" --lib \
+		kernel_rejects_illegal_netlink -- --ignored --exact --test-threads=1
+	unload_roswap
+	say "genl passed"
+}
+
+scenario_suspect() {
+	local child rc=0 before
+	set_dead_after 30
+	WANT_CHUNKS=4 WANT_NODES=2 WANT_LINKS=2 E2E_PROVIDERS=2 \
+		bring_up protection=replica2
+	say "swap while one provider is frozen"
+	swapoff -a || true
+	mkswap /dev/roswap0 >/dev/null
+	swapon -p 100 /dev/roswap0
+	setup_memcg
+	before=$(status_field degraded)
+	bash -c 'echo $$ >"$1/cgroup.procs" && shift && exec "$@"' _ \
+		"$E2E_CGROUP" "$MEMHOLD" -m 96m -i 1 -n 4 &
+	child=$!
+	sleep 0.4
+	freeze_provider 2
+	wait_state_for 2 suspect 20 || die "provider 2 did not become suspect within 2s"
+	wait "$child" || rc=$?
+	[[ $rc -eq 0 ]] || die "memhold failed while a replica was suspect, exit $rc"
+	[[ $(node_state 2) != dead ]] || die "a short freeze was judged dead"
+	[[ $(status_field lost) == 0 ]] || die "suspect lost pages"
+	dd if=/dev/urandom of=/dev/roswap0 bs=4096 count=256 seek=256 oflag=direct \
+		conv=fsync status=none || die "write during SUSPECT failed"
+	[[ $(status_field degraded) -gt ${before:-0} ]] ||
+		die "extents placed while a node was suspect were not marked short"
+	thaw_provider 2
+	wait_state_for 2 up 30 || die "provider 2 did not return to up"
+	[[ $(node_state 2) != dead ]] || die "thaw was judged dead"
+	say "suspect passed"
+}
+
+scenario_dead() {
+	local expect child rc=0
+	set_dead_after 10
+	WANT_CHUNKS=4 WANT_NODES=2 WANT_LINKS=2 E2E_PROVIDERS=2 \
+		bring_up protection=replica2
+	say "killing one replica"
+	expect=$(write_pattern)
+	kill_provider 2
+	wait_for "provider 2 dead" 20 wait_node_state 2 dead
+	[[ $(read_hash) == "$expect" ]] || die "replica2 readback mismatch after a dead node"
+	[[ $(status_field lost) == 0 ]] || die "replica2 lost pages ($(status_field lost))"
+
+	say "single provider death returns EIO and SIGBUS"
+	e2e_stop_stack
+	set_dead_after 10
+	bring_up
+	write_pattern >/dev/null
+	swapoff -a || true
+	mkswap /dev/roswap0 >/dev/null
+	swapon -p 100 /dev/roswap0
+	setup_memcg
+	bash -c 'echo $$ >"$1/cgroup.procs" && shift && exec "$@"' _ \
+		"$E2E_CGROUP" "$MEMHOLD" -m 96m -i 1 -n 30 &
+	child=$!
+	sleep 1.5
+	kill_provider 1
+	wait "$child" || rc=$?
+	[[ $rc -eq 135 ]] || die "memhold exit $rc, want SIGBUS (135)"
+	wait_for "provider 1 dead" 20 wait_node_state 1 dead
+	if dd if=/dev/roswap0 of=/dev/null bs=4096 count=1 iflag=direct status=none \
+		>"$E2E_LOG_DIR/lost-read.txt" 2>&1; then
+		die "read of a lost page succeeded"
+	fi
+	say "dead passed"
+}
+
+scenario_robust() {
+	local expect
+	set_dead_after 8
+	WANT_CHUNKS=4 WANT_NODES=2 WANT_LINKS=2 E2E_PROVIDERS=2 \
+		bring_up protection=replica2
+	expect=$(write_pattern)
+
+	say "freezing every provider is not a node death"
+	freeze_provider 1
+	freeze_provider 2
+	sleep 10
+	[[ $(node_state 1) != dead && $(node_state 2) != dead ]] ||
+		die "a majority freeze was judged dead"
+	thaw_provider 1
+	thaw_provider 2
+	wait_state_for 1 up 30 || die "provider 1 stayed down after thaw"
+	wait_state_for 2 up 30 || die "provider 2 stayed down after thaw"
+	[[ $(read_hash) == "$expect" ]] || die "readback mismatch after a majority freeze"
+
+	say "heartbeat QP drop does not condemn the node"
+	echo 1 >/sys/module/roswap/parameters/drop_heartbeat
+	sleep 2
+	[[ $(node_state 1) != dead && $(node_state 2) != dead ]] ||
+		die "dropping the heartbeat QP was judged dead"
+	wait_state_for 1 up 30 || die "provider 1 did not return after a heartbeat drop"
+	[[ $(read_hash) == "$expect" ]] || die "readback mismatch after a heartbeat drop"
+
+	say "data QP drop does not mark the node suspect"
+	echo 1 >/sys/module/roswap/parameters/drop_connection
+	sleep 1
+	[[ $(node_state 1) == up && $(node_state 2) == up ]] ||
+		die "a data disconnect changed node health ($(node_state 1) $(node_state 2))"
+
+	say "controller restart keeps a suspect node and still condemns it later"
+	freeze_provider 2
+	wait_state_for 2 suspect 20 || die "provider 2 did not become suspect"
+	kill -KILL "$(cat "$E2E_LOG_DIR/controller.pid")" 2>/dev/null || true
+	wait_for "controller port free" 10 controller_port_free
+	start_controller
+	sleep 1
+	[[ $(node_state 2) != dead ]] || die "controller restart immediately judged a suspect node dead"
+	wait_for "suspect becomes dead" 20 wait_node_state 2 dead
+
+	say "removing the module while a heartbeat read is in flight"
+	e2e_stop_stack
+	set_dead_after 30
+	bring_up
+	freeze_provider 1
+	wait_state_for 1 suspect 20 || die "provider 1 did not become suspect before rmmod"
+	unload_roswap
+	say "robust passed"
+}
+
+controller_port_free() {
+	! port_listening "$E2E_CTRL_PORT"
+}
+
 main() {
 	local scenario=${1:-}
 	case $scenario in
-	blk | swap | fault | params | stress) ;;
+	blk | swap | fault | params | stress | genl | suspect | dead | robust) ;;
 	*)
-		echo "usage: $0 blk|swap|fault|params|stress" >&2
+		echo "usage: $0 blk|swap|fault|params|stress|genl|suspect|dead|robust" >&2
 		exit 2
 		;;
 	esac
 	e2e_init
 	"scenario_$scenario"
+	assert_dmesg_clean
 }
 
 main "$@"

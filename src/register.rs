@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::controller::ChunkReport;
+use crate::genl::NodeHb;
 use crate::proto::cluster_service_client::ClusterServiceClient;
 use crate::proto::{ChunkDesc, HeartbeatRequest, JoinRequest};
 use crate::provider::ChunkExport;
@@ -17,6 +18,7 @@ pub fn spawn(
     epoch: u32,
     listen: String,
     chunks: Vec<ChunkExport>,
+    hb: NodeHb,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -41,7 +43,9 @@ pub fn spawn(
                 return;
             }
         };
-        rt.block_on(register_loop(addr, node_id, epoch, listen, chunks, stop));
+        rt.block_on(register_loop(
+            addr, node_id, epoch, listen, chunks, hb, stop,
+        ));
     })
 }
 
@@ -51,15 +55,54 @@ async fn register_loop(
     epoch: u32,
     listen: String,
     chunks: Vec<ChunkReport>,
+    hb: NodeHb,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        if let Err(err) = one_session(addr, node_id, epoch, &listen, &chunks, &stop).await {
+        if let Err(err) = one_session(addr, node_id, epoch, &listen, &chunks, hb, &stop).await {
             warn!("controller registration failed: {err}");
         }
         if wait_stop(&stop, Duration::from_secs(1)).await {
             break;
         }
+    }
+}
+
+pub(crate) fn join_request(node_id: u16, epoch: u32, listen: &str, hb: NodeHb) -> JoinRequest {
+    JoinRequest {
+        node_id: u32::from(node_id),
+        node_epoch: epoch,
+        listen_addr: listen.to_string(),
+        hb_raddr: hb.raddr,
+        hb_rkey: hb.rkey,
+        boot_id_lo: hb.boot_id,
+    }
+}
+
+pub(crate) fn heartbeat_request(
+    node_id: u16,
+    epoch: u32,
+    listen: &str,
+    chunks: &[ChunkReport],
+    hb: NodeHb,
+) -> HeartbeatRequest {
+    HeartbeatRequest {
+        node_id: u32::from(node_id),
+        node_epoch: epoch,
+        listen_addr: listen.to_string(),
+        chunks: chunks
+            .iter()
+            .map(|chunk| ChunkDesc {
+                gid: chunk.gid,
+                epoch: chunk.epoch,
+                raddr: chunk.raddr,
+                rkey: chunk.rkey,
+                size_mb: chunk.size_mb,
+            })
+            .collect(),
+        hb_raddr: hb.raddr,
+        hb_rkey: hb.rkey,
+        boot_id_lo: hb.boot_id,
     }
 }
 
@@ -69,34 +112,18 @@ async fn one_session(
     epoch: u32,
     listen: &str,
     chunks: &[ChunkReport],
+    hb: NodeHb,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = ClusterServiceClient::connect(format!("http://{addr}")).await?;
     client
-        .join(Request::new(JoinRequest {
-            node_id: u32::from(node_id),
-            node_epoch: epoch,
-            listen_addr: listen.to_string(),
-        }))
+        .join(Request::new(join_request(node_id, epoch, listen, hb)))
         .await?;
-    let descs: Vec<ChunkDesc> = chunks
-        .iter()
-        .map(|chunk| ChunkDesc {
-            gid: chunk.gid,
-            epoch: chunk.epoch,
-            raddr: chunk.raddr,
-            rkey: chunk.rkey,
-            size_mb: chunk.size_mb,
-        })
-        .collect();
     while !stop.load(Ordering::Relaxed) {
         client
-            .heartbeat(Request::new(HeartbeatRequest {
-                node_id: u32::from(node_id),
-                node_epoch: epoch,
-                listen_addr: listen.to_string(),
-                chunks: descs.clone(),
-            }))
+            .heartbeat(Request::new(heartbeat_request(
+                node_id, epoch, listen, chunks, hb,
+            )))
             .await?;
         if wait_stop(stop, Duration::from_secs(1)).await {
             break;
@@ -117,4 +144,33 @@ async fn wait_stop(stop: &AtomicBool, dur: Duration) -> bool {
         left = left.saturating_sub(slice);
     }
     stop.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_carries_the_remote_page() {
+        let chunk = ChunkReport {
+            gid: 1,
+            epoch: 2,
+            raddr: 3,
+            rkey: 4,
+            size_mb: 5,
+        };
+        let hb = NodeHb {
+            raddr: 0xabc,
+            rkey: 9,
+            boot_id: 42,
+        };
+        let request = heartbeat_request(7, 2, "10.0.0.7:18515", &[chunk], hb);
+        assert_eq!(request.hb_raddr, 0xabc);
+        assert_eq!(request.hb_rkey, 9);
+        assert_eq!(request.boot_id_lo, 42);
+        assert_eq!(request.chunks.len(), 1);
+        let join = join_request(7, 2, "10.0.0.7:18515", hb);
+        assert_eq!(join.hb_raddr, 0xabc);
+        assert_eq!(join.boot_id_lo, 42);
+    }
 }

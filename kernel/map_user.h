@@ -85,6 +85,11 @@ static inline void list_del(struct list_head *n)
 	INIT_LIST_HEAD(n);
 }
 
+static inline void list_del_init(struct list_head *n)
+{
+	list_del(n);
+}
+
 static inline int list_empty(const struct list_head *head)
 {
 	return head->next == head;
@@ -106,6 +111,7 @@ typedef struct {
 #define atomic_inc(a) ((void)__sync_add_and_fetch(&(a)->v, 1))
 #define atomic_dec(a) ((void)__sync_sub_and_fetch(&(a)->v, 1))
 #define atomic_add(i, a) ((void)__sync_add_and_fetch(&(a)->v, (i)))
+#define atomic_sub(i, a) ((void)__sync_sub_and_fetch(&(a)->v, (i)))
 #define atomic_dec_return(a) __sync_sub_and_fetch(&(a)->v, 1)
 
 #define rs_lock_nested(l) pthread_mutex_lock(&(l)->mu)
@@ -146,6 +152,11 @@ static inline void percpu_counter_dec(struct percpu_counter *fbc)
 static inline int64_t percpu_counter_sum(struct percpu_counter *fbc)
 {
 	return atomic_read(&fbc->n);
+}
+
+static inline void percpu_counter_add(struct percpu_counter *fbc, int64_t amount)
+{
+	__sync_add_and_fetch(&fbc->n.v, (int)amount);
 }
 
 struct xa_limit {

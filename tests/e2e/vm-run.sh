@@ -8,7 +8,7 @@ E2E_OUT=${1:?usage: $0 <output-dir> [scenarios...]}
 shift
 scenarios=("$@")
 if [[ ${#scenarios[@]} -eq 0 ]]; then
-	scenarios=(blk swap fault params stress)
+	scenarios=(blk swap fault params stress suspect dead)
 fi
 
 mkdir -p "$E2E_OUT"

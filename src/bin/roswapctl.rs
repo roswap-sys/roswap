@@ -33,14 +33,24 @@ fn kernel_status() -> io::Result<()> {
     let mut genl = GenlClient::open()?;
     let stats = genl.stats()?;
     println!(
-        "slots {} used {} free_extents {} nodes {} chunks {} links_up {}",
+        "slots {} used {} free_extents {} nodes {} chunks {} links_up {} degraded {} lost {}",
         stats.nr_slots,
         stats.used_slots,
         stats.free_extents,
         stats.nr_nodes,
         stats.nr_chunks,
-        stats.links_up
+        stats.links_up,
+        stats.degraded_slots,
+        stats.lost_slots
     );
+    for node in &stats.nodes {
+        let name = match node.state {
+            1 => "suspect",
+            2 => "dead",
+            _ => "up",
+        };
+        println!("node {} {}", node.id, name);
+    }
     Ok(())
 }
 
@@ -62,8 +72,13 @@ fn cluster_status(addr: &str) -> io::Result<()> {
         for node in response.nodes {
             writeln!(
                 out,
-                "node {} epoch {} listen {} synced {}",
-                node.node_id, node.node_epoch, node.listen_addr, node.kernel_synced
+                "node {} epoch {} listen {} synced {} state {} boot {:#x}",
+                node.node_id,
+                node.node_epoch,
+                node.listen_addr,
+                node.kernel_synced,
+                node.node_state,
+                node.boot_id_lo
             )?;
             for chunk in node.chunks {
                 writeln!(

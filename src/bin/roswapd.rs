@@ -70,6 +70,11 @@ fn init_roswapd_runtime(cfg: &Config) {
                     cfg.provider.node_epoch,
                     cfg.provider.listen_addr.to_string(),
                     runtime.exported_chunks(),
+                    roswap::genl::NodeHb {
+                        raddr: runtime.heartbeat.addr(),
+                        rkey: runtime.heartbeat.rkey(),
+                        boot_id: runtime.heartbeat.boot_id_lo(),
+                    },
                     Arc::clone(&stop),
                 )
             });

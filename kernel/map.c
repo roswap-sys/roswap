@@ -41,6 +41,7 @@ struct rs_node {
 	u16 id;
 	u32 weight;
 	u32 rtt_us;
+	u32 health;
 	atomic_t free_ext;
 	spinlock_t lock;
 	struct list_head free_chunks;
@@ -54,6 +55,7 @@ struct rs_chunk {
 	u32 nr_ext;
 	atomic_t free_ext;
 	unsigned long *bm;
+	bool retired;
 	struct rs_chunk_key __rcu *key;
 	struct list_head free_link;
 	struct rs_node *node;
@@ -76,6 +78,7 @@ struct rs_map {
 	u32 nr_extents;
 	struct percpu_counter used_slots;
 	struct percpu_counter degraded_slots;
+	struct percpu_counter lost_slots;
 	spinlock_t prot_lock;
 	u8 prot;
 	u8 frozen;
@@ -88,6 +91,54 @@ struct rs_map {
 };
 
 #define RS_S_SHORT		0x80
+
+void rs_hb_step(u32 state, u32 misses, u64 prev_tick, u64 tick, u64 expect_boot,
+		u64 boot, bool completed, u32 miss_limit, struct rs_hb_view *out)
+{
+	if (!out)
+		return;
+	if (!miss_limit)
+		miss_limit = RS_HB_MISS_LIMIT;
+	out->boot_changed = false;
+	out->tick = prev_tick;
+	out->state = state;
+	out->misses = misses;
+	if (!completed) {
+		out->misses = misses + 1;
+		if (out->misses >= miss_limit)
+			out->state = RS_NODE_SUSPECT;
+		return;
+	}
+	if (expect_boot && boot != expect_boot) {
+		out->boot_changed = true;
+		out->state = RS_NODE_SUSPECT;
+		out->misses = 0;
+		out->tick = tick;
+		return;
+	}
+	if (prev_tick) {
+		if (tick == prev_tick) {
+			out->misses = misses + 1;
+			if (out->misses >= miss_limit)
+				out->state = RS_NODE_SUSPECT;
+			return;
+		}
+		/* A small forward delta across u64 wrap is a live counter.
+		 * Anything else below prev_tick is a reboot, not a stall.
+		 */
+		if (tick < prev_tick &&
+		    !(prev_tick > ~RS_HB_TICK_JUMP && tick <= RS_HB_TICK_JUMP)) {
+			out->boot_changed = true;
+			out->state = RS_NODE_SUSPECT;
+			out->misses = 0;
+			out->tick = tick;
+			return;
+		}
+	}
+	out->state = RS_NODE_UP;
+	out->misses = 0;
+	out->tick = tick;
+}
 
 u32 rs_copy_note(u32 word, u32 which, bool success)
 {
@@ -358,8 +409,25 @@ static u32 rs_score(const struct rs_node *n)
 	return free_ext * n->weight / rtt;
 }
 
+static bool rs_node_open(const struct rs_node *n, u16 exclude, bool use_exclude,
+			 bool allow_suspect)
+{
+	u32 health;
+
+	if (atomic_read(&n->free_ext) <= 0)
+		return false;
+	if (use_exclude && n->id == exclude)
+		return false;
+	health = READ_ONCE(n->health);
+	if (health == RS_NODE_DEAD)
+		return false;
+	if (health == RS_NODE_SUSPECT && !allow_suspect)
+		return false;
+	return true;
+}
+
 static struct rs_node *rs_node_nth(struct rs_map *m, u16 exclude, bool use_exclude,
-				   u32 nth)
+				   bool allow_suspect, u32 nth)
 {
 	struct rs_node *n;
 	unsigned long idx = 0;
@@ -367,8 +435,7 @@ static struct rs_node *rs_node_nth(struct rs_map *m, u16 exclude, bool use_exclu
 
 	n = xa_find(&m->nodes, &idx, ULONG_MAX, XA_PRESENT);
 	while (n) {
-		if (atomic_read(&n->free_ext) > 0 &&
-		    !(use_exclude && n->id == exclude)) {
+		if (rs_node_open(n, exclude, use_exclude, allow_suspect)) {
 			if (seen == nth)
 				return n;
 			seen++;
@@ -378,7 +445,8 @@ static struct rs_node *rs_node_nth(struct rs_map *m, u16 exclude, bool use_exclu
 	return NULL;
 }
 
-static struct rs_node *rs_pick_node(struct rs_map *m, u16 exclude, bool use_exclude)
+static struct rs_node *rs_pick_node_kind(struct rs_map *m, u16 exclude,
+					 bool use_exclude, bool allow_suspect)
 {
 	struct rs_node *a_node, *b_node;
 	u32 nr = 0;
@@ -389,8 +457,7 @@ static struct rs_node *rs_pick_node(struct rs_map *m, u16 exclude, bool use_excl
 	rcu_read_lock();
 	n = xa_find(&m->nodes, &idx, ULONG_MAX, XA_PRESENT);
 	while (n) {
-		if (atomic_read(&n->free_ext) > 0 &&
-		    !(use_exclude && n->id == exclude))
+		if (rs_node_open(n, exclude, use_exclude, allow_suspect))
 			nr++;
 		n = xa_find_after(&m->nodes, &idx, ULONG_MAX, XA_PRESENT);
 	}
@@ -399,14 +466,14 @@ static struct rs_node *rs_pick_node(struct rs_map *m, u16 exclude, bool use_excl
 		return NULL;
 	}
 	if (nr == 1) {
-		a_node = rs_node_nth(m, exclude, use_exclude, 0);
+		a_node = rs_node_nth(m, exclude, use_exclude, allow_suspect, 0);
 		rcu_read_unlock();
 		return a_node;
 	}
 	a = rs_random() % nr;
 	b = rs_random() % nr;
-	a_node = rs_node_nth(m, exclude, use_exclude, a);
-	b_node = rs_node_nth(m, exclude, use_exclude, b);
+	a_node = rs_node_nth(m, exclude, use_exclude, allow_suspect, a);
+	b_node = rs_node_nth(m, exclude, use_exclude, allow_suspect, b);
 	rcu_read_unlock();
 	if (!a_node)
 		return b_node;
@@ -426,6 +493,9 @@ static int rs_claim(struct rs_node *node, u32 *loc)
 	spin_lock_irqsave(&node->lock, flags);
 	list_for_each_entry(c, &node->free_chunks, free_link) {
 		u32 ext;
+
+		if (c->retired)
+			continue;
 
 		for (ext = 0; ext < c->nr_ext; ext++) {
 			if (!(ext % BITS_PER_LONG) &&
@@ -459,6 +529,21 @@ static u16 rs_loc_node(struct rs_map *m, u32 loc)
 	id = c ? c->node_id : (u16)RS_MAX_NODES;
 	rcu_read_unlock();
 	return id;
+}
+
+static u32 rs_loc_health(struct rs_map *m, u32 loc)
+{
+	struct rs_chunk *c;
+	u32 health = RS_NODE_DEAD;
+
+	if (loc == RS_LOC_NONE)
+		return RS_NODE_DEAD;
+	rcu_read_lock();
+	c = xa_load(&m->chunks, loc >> RS_EXT_IDX_BITS);
+	if (c && c->node)
+		health = READ_ONCE(c->node->health);
+	rcu_read_unlock();
+	return health;
 }
 
 static void rs_release_bitmap(struct rs_map *m, u32 loc)
@@ -505,7 +590,7 @@ static void rs_release_loc(struct rs_map *m, u32 loc)
 	rs_release_bitmap(m, loc);
 }
 
-static int rs_steal_loc(struct rs_map *m, u16 exclude, u32 *loc)
+static int rs_steal_loc(struct rs_map *m, u16 exclude, u32 *loc, bool up_only)
 {
 	int me = rs_reserve_me();
 	int i;
@@ -523,6 +608,12 @@ static int rs_steal_loc(struct rs_map *m, u16 exclude, u32 *loc)
 			continue;
 		stolen = RS_LOC_NONE;
 		for (j = 0; j < other->n; j++) {
+			if (up_only) {
+				if (rs_loc_health(m, other->loc[j]) != RS_NODE_UP)
+					continue;
+			} else if (rs_loc_health(m, other->loc[j]) == RS_NODE_DEAD) {
+				continue;
+			}
 			if (exclude != RS_MAX_NODES &&
 			    rs_loc_node(m, other->loc[j]) == exclude)
 				continue;
@@ -549,24 +640,62 @@ static int rs_pop_loc(struct rs_map *m, u32 *loc)
 	int ret = -ENOSPC;
 
 	spin_lock_irqsave(&r->lock, flags);
-	if (r->n) {
-		*loc = r->loc[--r->n];
+	i = (int)r->n;
+	while (i-- > 0) {
+		u32 st = rs_loc_health(m, r->loc[i]);
+		u32 dropped;
+
+		if (st == RS_NODE_DEAD) {
+			dropped = r->loc[i];
+			r->loc[i] = r->loc[--r->n];
+			spin_unlock_irqrestore(&r->lock, flags);
+			rs_release_bitmap(m, dropped);
+			spin_lock_irqsave(&r->lock, flags);
+			i = (int)r->n;
+			continue;
+		}
+		if (st != RS_NODE_UP)
+			continue;
+		*loc = r->loc[i];
+		r->loc[i] = r->loc[--r->n];
 		spin_unlock_irqrestore(&r->lock, flags);
 		rs_reserve_unpin();
 		return 0;
 	}
 	spin_unlock_irqrestore(&r->lock, flags);
 
-	for (i = 0; i < RS_CPU_RESERVE; i++) {
-		struct rs_node *node = rs_pick_node(m, 0, false);
-		u32 one;
+	/* Fill from healthy nodes only. A SUSPECT node is a second pass,
+	 * so the LIFO pop cannot hand it out while a healthy extent remains.
+	 */
+	for (i = 0; i < 2 && !n; i++) {
+		int slot;
 
-		if (!node || rs_claim(node, &one))
-			break;
-		tmp[n++] = one;
+		for (slot = 0; slot < RS_CPU_RESERVE; slot++) {
+			struct rs_node *node = rs_pick_node_kind(m, 0, false, i == 1);
+			u32 one;
+
+			if (!node || rs_claim(node, &one))
+				break;
+			tmp[n++] = one;
+		}
 	}
 	if (!n) {
-		ret = rs_steal_loc(m, RS_MAX_NODES, loc);
+		ret = rs_steal_loc(m, RS_MAX_NODES, loc, false);
+		if (!ret) {
+			rs_reserve_unpin();
+			return 0;
+		}
+		spin_lock_irqsave(&r->lock, flags);
+		for (i = 0; i < (int)r->n; i++) {
+			if (rs_loc_health(m, r->loc[i]) == RS_NODE_DEAD)
+				continue;
+			*loc = r->loc[i];
+			r->loc[i] = r->loc[--r->n];
+			spin_unlock_irqrestore(&r->lock, flags);
+			rs_reserve_unpin();
+			return 0;
+		}
+		spin_unlock_irqrestore(&r->lock, flags);
 		rs_reserve_unpin();
 		return ret;
 	}
@@ -590,7 +719,7 @@ static int rs_pop_loc(struct rs_map *m, u32 *loc)
 
 static int rs_claim_other(struct rs_map *m, u16 exclude, u32 *loc)
 {
-	struct rs_node *node = rs_pick_node(m, exclude, true);
+	struct rs_node *node = rs_pick_node_kind(m, exclude, true, false);
 
 	if (!node)
 		return -ENOSPC;
@@ -608,6 +737,8 @@ static int rs_take_other(struct rs_map *m, u16 exclude, u32 *loc)
 	for (i = 0; i < r->n; i++) {
 		if (rs_loc_node(m, r->loc[i]) == exclude)
 			continue;
+		if (rs_loc_health(m, r->loc[i]) != RS_NODE_UP)
+			continue;
 		*loc = r->loc[i];
 		r->loc[i] = r->loc[--r->n];
 		spin_unlock_irqrestore(&r->lock, flags);
@@ -617,9 +748,26 @@ static int rs_take_other(struct rs_map *m, u16 exclude, u32 *loc)
 	spin_unlock_irqrestore(&r->lock, flags);
 	ret = rs_claim_other(m, exclude, loc);
 	if (ret)
-		ret = rs_steal_loc(m, exclude, loc);
+		ret = rs_steal_loc(m, exclude, loc, true);
 	rs_reserve_unpin();
 	return ret;
+}
+
+static int rs_take_live(struct rs_map *m, u32 *loc, u16 exclude, bool second)
+{
+	int tries;
+
+	for (tries = 0; tries < 16; tries++) {
+		int ret = second ? rs_take_other(m, exclude, loc) :
+				   rs_pop_loc(m, loc);
+
+		if (ret)
+			return ret;
+		if (rs_loc_health(m, *loc) != RS_NODE_DEAD)
+			return 0;
+		rs_release_bitmap(m, *loc);
+	}
+	return -ENOSPC;
 }
 
 static int rs_bind_extent(struct rs_map *m, struct rs_extent *ext, u8 prot)
@@ -629,7 +777,7 @@ static int rs_bind_extent(struct rs_map *m, struct rs_extent *ext, u8 prot)
 	int ret;
 
 	if (READ_ONCE(ext->loc0) == RS_LOC_NONE) {
-		ret = rs_pop_loc(m, &loc);
+		ret = rs_take_live(m, &loc, 0, false);
 		if (ret)
 			return ret;
 		if (cmpxchg(&ext->loc0, RS_LOC_NONE, loc) != RS_LOC_NONE)
@@ -638,7 +786,7 @@ static int rs_bind_extent(struct rs_map *m, struct rs_extent *ext, u8 prot)
 	if (prot != RS_PROT_REPLICA2 || READ_ONCE(ext->loc1) != RS_LOC_NONE)
 		return 0;
 	node = rs_loc_node(m, READ_ONCE(ext->loc0));
-	if (rs_take_other(m, node, &loc))
+	if (rs_take_live(m, &loc, node, true))
 		return 0;
 	if (cmpxchg(&ext->loc1, RS_LOC_NONE, loc) != RS_LOC_NONE)
 		rs_release_loc(m, loc);
@@ -851,6 +999,14 @@ int rs_map_init(u32 capacity_mb)
 		kfree(m);
 		return -ENOMEM;
 	}
+	if (percpu_counter_init(&m->lost_slots, 0, GFP_KERNEL)) {
+		percpu_counter_destroy(&m->degraded_slots);
+		percpu_counter_destroy(&m->used_slots);
+		kvfree(m->sstate);
+		kvfree(m->extents);
+		kfree(m);
+		return -ENOMEM;
+	}
 	m->counters = true;
 	spin_lock_init(&m->prot_lock);
 #ifdef RS_MAP_TEST
@@ -915,6 +1071,7 @@ void rs_map_exit(void)
 	xa_destroy(&m->nodes);
 	percpu_counter_destroy(&m->used_slots);
 	percpu_counter_destroy(&m->degraded_slots);
+	percpu_counter_destroy(&m->lost_slots);
 	kvfree(m->sstate);
 	kvfree(m->extents);
 	kfree(m);
@@ -1211,7 +1368,9 @@ int rs_map_lookup_read(u64 off, u32 len, struct rs_copies *out)
 
 static void rs_account_discard(struct rs_map *m, struct rs_extent *ext, u8 state)
 {
-	if ((state & RS_S_SHORT) && percpu_counter_sum(&m->degraded_slots) > 0)
+	if ((state & RS_S_LOST) && percpu_counter_sum(&m->lost_slots) > 0)
+		percpu_counter_dec(&m->lost_slots);
+	else if ((state & RS_S_SHORT) && percpu_counter_sum(&m->degraded_slots) > 0)
 		percpu_counter_dec(&m->degraded_slots);
 	if (percpu_counter_sum(&m->used_slots) > 0)
 		percpu_counter_dec(&m->used_slots);
@@ -1302,6 +1461,7 @@ void rs_map_finish_write(u64 off, u8 ok_mask)
 {
 	struct rs_map *m = rs_map;
 	struct rs_extent *ext;
+	unsigned long flags;
 	u32 slot, ext_i;
 	u8 state, neu, bound, wanted, valid;
 	bool short_old, short_new;
@@ -1311,6 +1471,8 @@ void rs_map_finish_write(u64 off, u8 ok_mask)
 	if ((off >> RS_PAGE_SHIFT) >= m->nr_slots)
 		return;
 	slot = (u32)(off >> RS_PAGE_SHIFT);
+	ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
+	spin_lock_irqsave(&rs_ext_locks[ext_i & (RS_EXT_LOCKS - 1)], flags);
 	do {
 		state = READ_ONCE(m->sstate[slot]);
 		short_old = false;
@@ -1318,14 +1480,20 @@ void rs_map_finish_write(u64 off, u8 ok_mask)
 		if (!(state & RS_S_USED)) {
 			neu = state & (u8)~RS_S_BUSY;
 		} else {
-			ext_i = slot >> (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
 			ext = &m->extents[ext_i];
 			bound = rs_bound_mask(ext);
 			wanted = rs_wanted_mask(m, bound);
 			valid = ok_mask & bound & (RS_S_C0 | RS_S_C1);
-			short_old = state & RS_S_SHORT;
-			short_new = valid != wanted;
-			neu = RS_S_USED | valid | (short_new ? RS_S_SHORT : 0);
+			/* A completion that lands after DEAD must not put the
+			 * dead copy back, and must not clear RS_S_LOST.
+			 */
+			if ((state & RS_S_LOST) && !valid) {
+				neu = RS_S_USED | RS_S_LOST;
+			} else {
+				short_old = state & RS_S_SHORT;
+				short_new = valid != wanted;
+				neu = RS_S_USED | valid | (short_new ? RS_S_SHORT : 0);
+			}
 		}
 	} while (cmpxchg(&m->sstate[slot], state, neu) != state);
 	if ((state & RS_S_USED) && short_new && !short_old)
@@ -1333,6 +1501,7 @@ void rs_map_finish_write(u64 off, u8 ok_mask)
 	else if ((state & RS_S_USED) && !short_new && short_old &&
 		 percpu_counter_sum(&m->degraded_slots) > 0)
 		percpu_counter_dec(&m->degraded_slots);
+	spin_unlock_irqrestore(&rs_ext_locks[ext_i & (RS_EXT_LOCKS - 1)], flags);
 }
 
 u32 rs_map_chunk_gen(u32 gid)
@@ -1368,6 +1537,296 @@ int rs_map_chunk_node(u32 gid, u16 *node_id)
 	}
 	*node_id = c->node_id;
 	rcu_read_unlock();
+	return 0;
+}
+
+static struct rs_node *rs_node_get(struct rs_map *m, u16 node_id)
+{
+	struct rs_node *node;
+
+	if (!m)
+		return NULL;
+	rcu_read_lock();
+	node = xa_load(&m->nodes, node_id);
+	rcu_read_unlock();
+	return node;
+}
+
+static int rs_health_set(struct rs_node *node, u32 want)
+{
+	u32 old;
+
+	do {
+		old = READ_ONCE(node->health);
+		if (old == want)
+			return 0;
+		if (old == RS_NODE_DEAD)
+			return -EBUSY;
+	} while (cmpxchg(&node->health, old, want) != old);
+	return 1;
+}
+
+int rs_map_node_set_state(u16 node_id, u32 state)
+{
+	struct rs_node *node;
+
+	if (state != RS_NODE_UP && state != RS_NODE_SUSPECT)
+		return -EINVAL;
+	node = rs_node_get(rs_map, node_id);
+	if (!node)
+		return -ENOENT;
+	return rs_health_set(node, state);
+}
+
+u32 rs_map_node_state(u16 node_id)
+{
+	struct rs_node *node = rs_node_get(rs_map, node_id);
+
+	return node ? READ_ONCE(node->health) : RS_NODE_DEAD;
+}
+
+int rs_map_node_list(struct rs_node_info *out, u32 cap)
+{
+	struct rs_map *m = rs_map;
+	unsigned long idx = 0;
+	u32 n = 0;
+
+	if (!m)
+		return -ENODEV;
+	rcu_read_lock();
+	for (;;) {
+		struct rs_node *node = xa_find(&m->nodes, &idx, ULONG_MAX, XA_PRESENT);
+
+		if (!node)
+			break;
+		if (out && n < cap) {
+			out[n].id = node->id;
+			out[n].state = (u8)READ_ONCE(node->health);
+			out[n].pad = 0;
+		}
+		n++;
+		if (idx == ULONG_MAX)
+			break;
+		idx++;
+	}
+	rcu_read_unlock();
+	return (int)n;
+}
+
+static void rs_kill_slot(struct rs_map *m, u32 slot, u8 drop, u8 bound,
+			  int *deg, int *lost)
+{
+	u8 state, neu, keep;
+
+	do {
+		u8 copies;
+
+		state = READ_ONCE(m->sstate[slot]);
+		if (!(state & RS_S_USED) || (state & RS_S_LOST))
+			return;
+		copies = state & (RS_S_C0 | RS_S_C1);
+		/* A first write still in flight has no copy bit. Leave it
+		 * for finish_write when another loc survives.
+		 */
+		if (!copies) {
+			if (bound & (u8)~drop)
+				return;
+			keep = 0;
+			neu = (u8)(RS_S_USED | (state & RS_S_BUSY) | RS_S_LOST);
+		} else {
+			keep = (u8)(copies & (u8)~drop);
+			if (keep == copies)
+				return;
+			if (keep)
+				neu = (u8)(RS_S_USED | (state & RS_S_BUSY) | keep |
+					   RS_S_SHORT);
+			else
+				neu = (u8)(RS_S_USED | (state & RS_S_BUSY) | RS_S_LOST);
+		}
+	} while (cmpxchg(&m->sstate[slot], state, neu) != state);
+	if (keep) {
+		if (!(state & RS_S_SHORT))
+			(*deg)++;
+	} else {
+		if (state & RS_S_SHORT)
+			(*deg)--;
+		(*lost)++;
+	}
+}
+
+static void rs_apply_delta(struct percpu_counter *ctr, int delta)
+{
+	if (!delta)
+		return;
+	if (delta > 0) {
+		percpu_counter_add(ctr, delta);
+		return;
+	}
+	if (percpu_counter_sum(ctr) >= (int64_t)-delta)
+		percpu_counter_add(ctr, delta);
+}
+
+int rs_map_node_kill(u16 node_id, u32 *lost_new)
+{
+	struct rs_map *m = rs_map;
+	struct rs_node *node;
+	u32 ext_i, old, lost_total = 0;
+
+	if (lost_new)
+		*lost_new = 0;
+	if (!m)
+		return -ENODEV;
+	node = rs_node_get(m, node_id);
+	if (!node)
+		return -ENOENT;
+	do {
+		old = READ_ONCE(node->health);
+		if (old == RS_NODE_DEAD)
+			return 0;
+	} while (cmpxchg(&node->health, old, (u32)RS_NODE_DEAD) != old);
+	for (ext_i = 0; ext_i < m->nr_extents; ext_i++) {
+		struct rs_extent *ext = &m->extents[ext_i];
+		unsigned long flags;
+		u32 locs[RS_NR_COPIES];
+		u32 base = ext_i << (RS_EXTENT_SHIFT - RS_PAGE_SHIFT);
+		u8 drop = 0;
+		int deg = 0, lost = 0;
+		u32 i;
+
+		spin_lock_irqsave(&rs_ext_locks[ext_i & (RS_EXT_LOCKS - 1)], flags);
+		locs[0] = READ_ONCE(ext->loc0);
+		locs[1] = READ_ONCE(ext->loc1);
+		for (i = 0; i < RS_NR_COPIES; i++) {
+			if (locs[i] == RS_LOC_NONE)
+				continue;
+			if (rs_loc_node(m, locs[i]) != node_id)
+				continue;
+			drop |= (u8)(1u << i);
+		}
+		if (drop) {
+			u32 pg;
+			u8 bound = 0;
+
+			if (locs[0] != RS_LOC_NONE)
+				bound |= RS_S_C0;
+			if (locs[1] != RS_LOC_NONE)
+				bound |= RS_S_C1;
+			for (pg = 0; pg < RS_EXTENT_PAGES; pg++)
+				rs_kill_slot(m, base + pg, drop, bound, &deg, &lost);
+			if (drop & RS_S_C0) {
+				WRITE_ONCE(ext->loc0, RS_LOC_NONE);
+				rs_release_loc(m, locs[0]);
+			}
+			if (drop & RS_S_C1) {
+				WRITE_ONCE(ext->loc1, RS_LOC_NONE);
+				rs_release_loc(m, locs[1]);
+			}
+			rs_apply_delta(&m->degraded_slots, deg);
+			rs_apply_delta(&m->lost_slots, lost);
+			lost_total += (u32)lost;
+		}
+		spin_unlock_irqrestore(&rs_ext_locks[ext_i & (RS_EXT_LOCKS - 1)], flags);
+	}
+	if (lost_new)
+		*lost_new = lost_total;
+	return 0;
+}
+
+int rs_map_chunk_retire(u16 node_id, u32 local_gid)
+{
+	struct rs_map *m = rs_map;
+	struct rs_node *node;
+	struct rs_chunk *c;
+	unsigned long flags;
+	int free_ext;
+
+	if (!m)
+		return -ENODEV;
+	rcu_read_lock();
+	node = xa_load(&m->nodes, node_id);
+	c = node ? xa_load(&node->by_local, local_gid) : NULL;
+	rcu_read_unlock();
+	if (!c)
+		return -ENOENT;
+	spin_lock_irqsave(&node->lock, flags);
+	if (!c->retired) {
+		free_ext = atomic_read(&c->free_ext);
+		if (free_ext > 0 && !list_empty(&c->free_link))
+			list_del_init(&c->free_link);
+		atomic_set(&c->free_ext, 0);
+		if (free_ext > 0)
+			atomic_add(-free_ext, &node->free_ext);
+		c->retired = true;
+	}
+	spin_unlock_irqrestore(&node->lock, flags);
+	return 0;
+}
+
+static void rs_reserve_drop_node(struct rs_map *m, u16 node_id)
+{
+	int cpu;
+
+	for (cpu = 0; cpu < rs_reserve_nr(); cpu++) {
+		struct rs_reserve *r = rs_reserve_at(cpu);
+		unsigned long flags;
+		u8 i;
+
+		spin_lock_irqsave(&r->lock, flags);
+		for (i = 0; i < r->n; ) {
+			if (rs_loc_node(m, r->loc[i]) != node_id) {
+				i++;
+				continue;
+			}
+			r->loc[i] = r->loc[--r->n];
+		}
+		spin_unlock_irqrestore(&r->lock, flags);
+	}
+}
+
+int rs_map_node_del(u16 node_id)
+{
+	struct rs_map *m = rs_map;
+	struct rs_node *node;
+	unsigned long idx;
+	u32 ext_i;
+
+	if (!m)
+		return -ENODEV;
+	node = rs_node_get(m, node_id);
+	if (!node)
+		return -ENOENT;
+	if (READ_ONCE(node->health) != RS_NODE_DEAD)
+		return -EBUSY;
+	for (ext_i = 0; ext_i < m->nr_extents; ext_i++) {
+		struct rs_extent *ext = &m->extents[ext_i];
+
+		if (rs_loc_node(m, READ_ONCE(ext->loc0)) == node_id ||
+		    rs_loc_node(m, READ_ONCE(ext->loc1)) == node_id)
+			return -EBUSY;
+	}
+	rs_reserve_drop_node(m, node_id);
+	idx = 0;
+	for (;;) {
+		struct rs_chunk *c = xa_find(&node->by_local, &idx, ULONG_MAX, XA_PRESENT);
+		unsigned long cur;
+
+		if (!c)
+			break;
+		cur = idx;
+		if (idx < ULONG_MAX)
+			idx++;
+		xa_erase(&node->by_local, cur);
+		xa_erase(&m->chunks, c->global_gid);
+#ifndef RS_MAP_TEST
+		synchronize_rcu();
+#endif
+		rs_chunk_free(c);
+		if (cur == ULONG_MAX)
+			break;
+	}
+	xa_erase(&m->nodes, node_id);
+	xa_destroy(&node->by_local);
+	kfree(node);
 	return 0;
 }
 
@@ -1410,6 +1869,7 @@ void rs_map_stats(struct rs_map_stats *out)
 	out->nr_nodes = nodes;
 	out->free_extents = free_ext + rs_reserve_held();
 	out->degraded_slots = (u32)percpu_counter_sum(&m->degraded_slots);
+	out->lost_slots = (u32)percpu_counter_sum(&m->lost_slots);
 }
 
 #ifdef RS_MAP_TEST

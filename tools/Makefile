@@ -1,6 +1,6 @@
 CFLAGS ?= -O2 -Wall -Wextra
 
-PROGS := blkcheck memhold
+PROGS := blkcheck memhold latread
 
 all: $(PROGS)
 

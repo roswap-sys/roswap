@@ -64,8 +64,14 @@ module_param(qp_send_depth, uint, 0444);
 MODULE_PARM_DESC(qp_send_depth, "send WR depth of each RC QP");
 
 static char *local_addrs;
+static uint hb_interval_ms = 50;
+static uint hb_miss_limit = RS_HB_MISS_LIMIT;
 module_param(local_addrs, charp, 0444);
 MODULE_PARM_DESC(local_addrs, "comma-separated local RDMA IPv4 addresses");
+module_param(hb_interval_ms, uint, 0644);
+MODULE_PARM_DESC(hb_interval_ms, "heartbeat probe period in milliseconds");
+module_param(hb_miss_limit, uint, 0644);
+MODULE_PARM_DESC(hb_miss_limit, "missed probes before a node is suspect");
 
 struct rs_dev {
 	struct ib_device *ibdev;
@@ -114,6 +120,7 @@ struct rs_qp {
 	int send_depth;
 	bool cq_pool;
 	bool poll_direct;
+	u16 send_limit;
 	u16 cpu;
 	u8 set;
 	u8 purpose;
@@ -138,6 +145,28 @@ struct rs_link {
 	struct rs_qp *qps;
 	struct delayed_work recover_dwork;
 	wait_queue_head_t wq;
+	u64 hb_raddr;
+	u32 hb_rkey;
+	u64 hb_boot;
+	u64 hb_tick;
+	u32 hb_misses;
+	bool hb_on;
+	bool hb_posted;
+	bool hb_fault;
+	bool hb_ready;
+	bool hb_drop;
+	struct rs_qp hb;
+	struct delayed_work hb_dwork;
+	void *hb_buf;
+	dma_addr_t hb_dma;
+	struct ib_cqe hb_cqe;
+};
+
+struct rs_hb_wire {
+	u64 tick;
+	u64 boot;
+	u32 epoch;
+	u32 flags;
 };
 
 struct rs_wr {
@@ -193,6 +222,7 @@ enum {
 	RS_QP_READY,
 	RS_QP_RETRY,
 	RS_QP_DEAD,
+	RS_QP_SUSPECT,
 };
 
 struct rs_pick {
@@ -424,6 +454,9 @@ static void rs_classify(const struct rs_copies *copies, bool read, int hctx_set,
 		rcu_read_unlock();
 		if (!link)
 			pick[i].kind = RS_QP_DEAD;
+		else if (read && pick[i].kind == RS_QP_READY &&
+			 rs_map_node_state(copies->r[i].node_id) == RS_NODE_SUSPECT)
+			pick[i].kind = RS_QP_SUSPECT;
 		if (pick[i].kind == RS_QP_RETRY)
 			*retry = true;
 	}
@@ -431,17 +464,26 @@ static void rs_classify(const struct rs_copies *copies, bool read, int hctx_set,
 
 static u8 rs_ready_mask(const struct rs_pick *pick, bool first_only)
 {
-	u8 mask = 0;
+	u8 ready = 0, suspect = 0;
 	u32 i;
 
 	for (i = 0; i < RS_NR_COPIES; i++) {
-		if (pick[i].kind != RS_QP_READY)
-			continue;
-		mask |= (u8)(1u << i);
-		if (first_only)
-			break;
+		if (pick[i].kind == RS_QP_READY)
+			ready |= (u8)(1u << i);
+		else if (pick[i].kind == RS_QP_SUSPECT)
+			suspect |= (u8)(1u << i);
 	}
-	return mask;
+	if (!first_only)
+		return (u8)(ready | suspect);
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if (ready & (1u << i))
+			return (u8)(1u << i);
+	}
+	for (i = 0; i < RS_NR_COPIES; i++) {
+		if (suspect & (1u << i))
+			return (u8)(1u << i);
+	}
+	return 0;
 }
 
 static void rs_zero_page(struct page *page, unsigned int off, unsigned int len)
@@ -1173,8 +1215,9 @@ static int rs_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *ev)
 {
 	struct rs_qp *qp = id->context;
 
-	if (ev->event == RDMA_CM_EVENT_DISCONNECTED ||
-	    ev->event == RDMA_CM_EVENT_DEVICE_REMOVAL) {
+	if (ev->event == RDMA_CM_EVENT_DEVICE_REMOVAL ||
+	    (ev->event == RDMA_CM_EVENT_DISCONNECTED &&
+	     qp->purpose != RS_QP_HB)) {
 		pr_warn("cpu %u %s\n", qp->cpu, rdma_event_msg(ev->event));
 		if (atomic_read(&qp->state) == RS_QP_UP)
 			rs_link_failed(qp->link);
@@ -1196,7 +1239,7 @@ static int rs_cm_wait(struct rs_qp *qp, enum rdma_cm_event_type expected,
 
 		if (READ_ONCE(qp->link->stop))
 			return -ECONNABORTED;
-		if (rs_give_up(qp->link) &&
+		if (qp->purpose != RS_QP_HB && rs_give_up(qp->link) &&
 		    atomic_read(&qp->link->state) != RS_LINK_UP)
 			return -ETIMEDOUT;
 		if (time_after(jiffies, end))
@@ -1403,6 +1446,8 @@ static int rs_qp_connect(struct rs_qp *qp)
 		}
 	}
 	qp->send_depth = qp->dev->send_depth;
+	if (qp->send_limit && qp->send_limit < qp->send_depth)
+		qp->send_depth = qp->send_limit;
 	vec = rs_comp_vector(id->device, qp->cpu);
 	if (qp->poll_direct)
 		qp->cq = ib_alloc_cq(id->device, qp, qp->send_depth, vec,
@@ -1577,6 +1622,8 @@ static void rs_connect_done(struct rs_link *link, bool ok)
 	atomic_set(&link->recover_busy, 0);
 	wake_up(&link->wq);
 	rs_run_queues();
+	if (READ_ONCE(link->hb_on))
+		mod_delayed_work(roswap_cm, &link->hb_dwork, 0);
 }
 
 static void rs_qp_connect_work(struct work_struct *work)
@@ -1783,7 +1830,196 @@ err_tag:
 	return ret;
 }
 
-int roswap_node_add(u16 node_id, const char *addr)
+static void rs_hb_cqe_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	(void)cq;
+	(void)wc;
+}
+
+static void rs_hb_unmap(struct rs_link *link)
+{
+	if (link->hb_dma && link->hb.dev && link->hb.dev->ibdev) {
+		ib_dma_unmap_single(link->hb.dev->ibdev, link->hb_dma, PAGE_SIZE,
+				    DMA_FROM_DEVICE);
+		link->hb_dma = 0;
+	}
+	kfree(link->hb_buf);
+	link->hb_buf = NULL;
+}
+
+static int rs_hb_map(struct rs_link *link)
+{
+	struct ib_device *dev;
+
+	if (link->hb_dma)
+		return 0;
+	if (!link->hb.dev || !link->hb.dev->ibdev)
+		return -ENODEV;
+	dev = link->hb.dev->ibdev;
+	if (!link->hb_buf) {
+		link->hb_buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!link->hb_buf)
+			return -ENOMEM;
+	}
+	link->hb_dma = ib_dma_map_single(dev, link->hb_buf, PAGE_SIZE,
+					 DMA_FROM_DEVICE);
+	if (ib_dma_mapping_error(dev, link->hb_dma)) {
+		link->hb_dma = 0;
+		return -EIO;
+	}
+	return 0;
+}
+
+static int rs_hb_post(struct rs_link *link)
+{
+	struct ib_rdma_wr wr = {};
+	struct ib_sge sge;
+	struct rs_qp *qp = &link->hb;
+
+	if (!qp->cm_id || !qp->dev || !qp->dev->pd || !link->hb_dma)
+		return -ENODEV;
+	sge.addr = link->hb_dma;
+	sge.length = sizeof(struct rs_hb_wire);
+	sge.lkey = qp->dev->pd->local_dma_lkey;
+	link->hb_cqe.done = rs_hb_cqe_done;
+	wr.wr.opcode = IB_WR_RDMA_READ;
+	wr.wr.wr_cqe = &link->hb_cqe;
+	wr.wr.sg_list = &sge;
+	wr.wr.num_sge = 1;
+	wr.wr.send_flags = IB_SEND_SIGNALED;
+	wr.remote_addr = READ_ONCE(link->hb_raddr);
+	wr.rkey = READ_ONCE(link->hb_rkey);
+	return ib_post_send(qp->cm_id->qp, &wr.wr, NULL);
+}
+
+static void rs_hb_note(struct rs_link *link, bool completed, u64 tick, u64 boot)
+{
+	struct rs_hb_view view;
+	u32 prev = rs_map_node_state(link->node_id);
+	u32 limit = hb_miss_limit ? hb_miss_limit : RS_HB_MISS_LIMIT;
+	int changed;
+
+	if (prev == RS_NODE_DEAD)
+		return;
+	if (link->hb_fault)
+		prev = RS_NODE_SUSPECT;
+	rs_hb_step(prev, link->hb_misses, link->hb_tick, tick, link->hb_boot,
+		   boot, completed, limit, &view);
+	link->hb_misses = view.misses;
+	link->hb_tick = view.tick;
+	if (view.boot_changed)
+		link->hb_fault = true;
+	if (completed && !view.boot_changed && boot)
+		link->hb_boot = boot;
+	if (link->hb_fault)
+		view.state = RS_NODE_SUSPECT;
+	changed = rs_map_node_set_state(link->node_id, view.state);
+	if (changed < 0)
+		return;
+	if (changed > 0 && view.state == RS_NODE_SUSPECT)
+		pr_info("node %u suspect\n", link->node_id);
+	if (changed > 0 && view.state == RS_NODE_UP)
+		pr_info("node %u up\n", link->node_id);
+	if (changed > 0 || view.boot_changed)
+		rs_genl_node_state(link->node_id, view.state,
+				   view.boot_changed ? boot : 0);
+}
+
+static int rs_hb_connect(struct rs_link *link)
+{
+	struct rs_qp *qp = &link->hb;
+	int ret;
+
+	if (atomic_read(&qp->state) == RS_QP_UP && qp->cm_id)
+		return 0;
+	rs_qp_teardown(qp);
+	if (!link->hb_ready) {
+		rs_qp_prep(qp, link, 0, RS_QP_FAULT);
+		qp->purpose = RS_QP_HB;
+		qp->poll_direct = true;
+		qp->send_limit = 2;
+		link->hb_ready = true;
+	}
+	ret = rs_qp_connect(qp);
+	if (ret)
+		return ret;
+	atomic_set(&qp->state, RS_QP_UP);
+	return rs_hb_map(link);
+}
+
+static void rs_hb_work(struct work_struct *work)
+{
+	struct rs_link *link = container_of(to_delayed_work(work), struct rs_link,
+					    hb_dwork);
+	unsigned int noio = memalloc_noio_save();
+	unsigned int interval = hb_interval_ms ? hb_interval_ms : 50;
+
+	if (READ_ONCE(link->stop) || !READ_ONCE(link->hb_on))
+		goto out;
+	if (rs_map_node_state(link->node_id) == RS_NODE_DEAD)
+		goto out;
+	if (READ_ONCE(link->hb_drop)) {
+		WRITE_ONCE(link->hb_drop, false);
+		link->hb_posted = false;
+		rs_qp_teardown(&link->hb);
+		rs_hb_note(link, false, 0, 0);
+	}
+	if (link->hb_posted && link->hb.cq) {
+		struct ib_wc wc;
+		int n = ib_poll_cq(link->hb.cq, 1, &wc);
+
+		if (n > 0) {
+			struct rs_hb_wire wire;
+
+			link->hb_posted = false;
+			memset(&wire, 0, sizeof(wire));
+			if (wc.status == IB_WC_SUCCESS && link->hb_buf) {
+				smp_rmb();
+				memcpy(&wire, link->hb_buf, sizeof(wire));
+				rs_hb_note(link, true, wire.tick, wire.boot);
+			} else {
+				rs_qp_teardown(&link->hb);
+				rs_hb_note(link, false, 0, 0);
+			}
+		} else if (n < 0) {
+			link->hb_posted = false;
+			rs_qp_teardown(&link->hb);
+			rs_hb_note(link, false, 0, 0);
+		} else {
+			rs_hb_note(link, false, 0, 0);
+		}
+	}
+	if (!link->hb_posted && !READ_ONCE(link->stop) && link->chunk_mb &&
+	    READ_ONCE(link->hb_raddr)) {
+		if (rs_hb_connect(link) || rs_hb_post(link))
+			rs_hb_note(link, false, 0, 0);
+		else
+			link->hb_posted = true;
+	}
+	if (!READ_ONCE(link->stop) && READ_ONCE(link->hb_on) &&
+	    rs_map_node_state(link->node_id) != RS_NODE_DEAD)
+		mod_delayed_work(roswap_cm, &link->hb_dwork,
+				 msecs_to_jiffies(interval));
+out:
+	memalloc_noio_restore(noio);
+}
+
+static void rs_hb_configure(struct rs_link *link, const struct rs_hb_cfg *hb)
+{
+	if (!hb || !hb->raddr)
+		return;
+	WRITE_ONCE(link->hb_raddr, hb->raddr);
+	WRITE_ONCE(link->hb_rkey, hb->rkey);
+	if (!link->hb_boot)
+		link->hb_boot = hb->boot_id;
+	else if (hb->boot_id && link->hb_boot != hb->boot_id)
+		link->hb_fault = true;
+	WRITE_ONCE(link->hb_on, true);
+	if (roswap_cm)
+		mod_delayed_work(roswap_cm, &link->hb_dwork, 0);
+}
+
+int roswap_node_add(u16 node_id, const char *addr, const struct rs_hb_cfg *hb)
 {
 	struct rs_link *link, *old;
 	struct sockaddr_in dst;
@@ -1797,7 +2033,18 @@ int roswap_node_add(u16 node_id, const char *addr)
 	mutex_lock(&rs_link_mu);
 	old = xa_load(&rs_links, node_id);
 	if (old) {
-		ret = strcmp(old->server, addr) ? -EEXIST : 0;
+		if (strcmp(old->server, addr)) {
+			ret = -EEXIST;
+			goto out;
+		}
+		if (rs_map_node_state(node_id) == RS_NODE_DEAD) {
+			mutex_unlock(&rs_link_mu);
+			ret = roswap_node_del(node_id);
+			if (ret)
+				return ret;
+			return roswap_node_add(node_id, addr, hb);
+		}
+		rs_hb_configure(old, hb);
 		goto out;
 	}
 	link = kzalloc(sizeof(*link), GFP_KERNEL);
@@ -1810,6 +2057,7 @@ int roswap_node_add(u16 node_id, const char *addr)
 	strscpy(link->server, addr, sizeof(link->server));
 	init_waitqueue_head(&link->wq);
 	INIT_DELAYED_WORK(&link->recover_dwork, rs_link_recover);
+	INIT_DELAYED_WORK(&link->hb_dwork, rs_hb_work);
 	atomic_set(&link->state, RS_LINK_OFF);
 	ret = rs_map_node_add(node_id);
 	if (ret) {
@@ -1821,10 +2069,85 @@ int roswap_node_add(u16 node_id, const char *addr)
 		kfree(link);
 		if (ret == -EBUSY)
 			ret = -EEXIST;
+		goto out;
 	}
+	rs_hb_configure(link, hb);
 out:
 	mutex_unlock(&rs_link_mu);
 	return ret;
+}
+
+int roswap_node_del(u16 node_id)
+{
+	struct rs_link *link;
+	int ret, i;
+
+	mutex_lock(&rs_link_mu);
+	link = xa_load(&rs_links, node_id);
+	if (link) {
+		WRITE_ONCE(link->stop, true);
+		WRITE_ONCE(link->hb_on, false);
+		wake_up(&link->wq);
+	}
+	mutex_unlock(&rs_link_mu);
+	if (!link)
+		return rs_map_node_del(node_id);
+	cancel_delayed_work_sync(&link->recover_dwork);
+	cancel_delayed_work_sync(&link->hb_dwork);
+	if (link->qps) {
+		for (i = 0; i < link->nr_sets * 2; i++) {
+			cancel_work_sync(&link->qps[i].connect_work);
+			cancel_work_sync(&link->qps[i].poll_work);
+		}
+	}
+	rs_link_drain(link);
+	link->hb_posted = false;
+	rs_qp_teardown(&link->hb);
+	ret = rs_map_node_del(node_id);
+	if (ret)
+		return ret;
+	mutex_lock(&rs_link_mu);
+	if (xa_load(&rs_links, node_id) == link)
+		xa_erase(&rs_links, node_id);
+	else
+		link = NULL;
+	mutex_unlock(&rs_link_mu);
+	if (!link)
+		return 0;
+	if (link->qps)
+		rs_qps_reserved -= link->nr_sets * 2;
+	kfree(link->qps);
+	rs_hb_unmap(link);
+	kfree(link);
+	return 0;
+}
+
+int roswap_node_set_state(u16 node_id, u32 state)
+{
+	u32 lost = 0;
+	int ret;
+
+	if (state == RS_NODE_DEAD) {
+		ret = rs_map_node_kill(node_id, &lost);
+		if (ret)
+			return ret;
+		rs_genl_node_state(node_id, RS_NODE_DEAD, 0);
+		if (lost)
+			rs_genl_data_lost(node_id, lost);
+		pr_info("node %u dead, lost %u\n", node_id, lost);
+		return 0;
+	}
+	ret = rs_map_node_set_state(node_id, state);
+	if (ret < 0)
+		return ret;
+	if (ret > 0)
+		rs_genl_node_state(node_id, state, 0);
+	return 0;
+}
+
+int roswap_chunk_retire(u16 node_id, u32 local_gid)
+{
+	return rs_map_chunk_retire(node_id, local_gid);
 }
 
 int roswap_chunk_add(u16 node_id, u32 gid, u32 epoch, u64 base, u32 remote_key,
@@ -1953,6 +2276,35 @@ static const struct kernel_param_ops rs_drop_ops = {
 module_param_cb(drop_connection, &rs_drop_ops, NULL, 0200);
 MODULE_PARM_DESC(drop_connection, "write anything to drop the RC connections");
 
+static int rs_drop_hb_set(const char *val, const struct kernel_param *kp)
+{
+	struct rs_link *link;
+	unsigned long idx = 0;
+
+	(void)val;
+	(void)kp;
+	rcu_read_lock();
+	for (;;) {
+		link = xa_find(&rs_links, &idx, ULONG_MAX, XA_PRESENT);
+		if (!link)
+			break;
+		WRITE_ONCE(link->hb_drop, true);
+		if (idx == ULONG_MAX)
+			break;
+		idx++;
+	}
+	rcu_read_unlock();
+	return 0;
+}
+
+static const struct kernel_param_ops rs_drop_hb_ops = {
+	.set = rs_drop_hb_set,
+	.get = rs_drop_get,
+};
+
+module_param_cb(drop_heartbeat, &rs_drop_hb_ops, NULL, 0200);
+MODULE_PARM_DESC(drop_heartbeat, "write anything to tear heartbeat QPs down");
+
 static void rs_stop_links(void)
 {
 	struct rs_link *link;
@@ -1960,6 +2312,7 @@ static void rs_stop_links(void)
 
 	xa_for_each(&rs_links, idx, link) {
 		WRITE_ONCE(link->stop, true);
+		WRITE_ONCE(link->hb_on, false);
 		atomic_set(&link->state, RS_LINK_OFF);
 		wake_up(&link->wq);
 	}
@@ -1974,6 +2327,7 @@ static void rs_cancel_links(void)
 		int i;
 
 		cancel_delayed_work_sync(&link->recover_dwork);
+		cancel_delayed_work_sync(&link->hb_dwork);
 		if (!link->qps)
 			continue;
 		for (i = 0; i < link->nr_sets * 2; i++) {
@@ -1988,8 +2342,11 @@ static void rs_teardown_links(void)
 	struct rs_link *link;
 	unsigned long idx = 0;
 
-	xa_for_each(&rs_links, idx, link)
+	xa_for_each(&rs_links, idx, link) {
 		rs_link_drain(link);
+		link->hb_posted = false;
+		rs_qp_teardown(&link->hb);
+	}
 }
 
 static void rs_free_links(void)
@@ -2000,6 +2357,7 @@ static void rs_free_links(void)
 	xa_for_each(&rs_links, idx, link) {
 		xa_erase(&rs_links, link->node_id);
 		kfree(link->qps);
+		rs_hb_unmap(link);
 		kfree(link);
 	}
 	xa_destroy(&rs_links);
@@ -2283,7 +2641,7 @@ static int __init roswap_init(void)
 		goto err_wq;
 	}
 	if (server) {
-		ret = roswap_node_add(0, server);
+		ret = roswap_node_add(0, server, NULL);
 		if (ret)
 			goto err_conn;
 		ret = roswap_chunk_add(0, 0, 0, raddr, rkey, chunk_size_mb);
@@ -2342,6 +2700,7 @@ static void __exit roswap_exit(void)
 	rs_genl_unregister();
 	rs_stop_links();
 	rs_cancel_links();
+	rs_genl_exit();
 	if (roswap_disk)
 		blk_mq_quiesce_queue(roswap_disk->queue);
 	synchronize_rcu();

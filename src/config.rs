@@ -37,12 +37,19 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ControllerConfig {
     pub listen_addr: SocketAddr,
+    #[serde(default = "default_dead_after_s")]
+    pub dead_after_s: u64,
+}
+
+fn default_dead_after_s() -> u64 {
+    10
 }
 
 impl Default for ControllerConfig {
     fn default() -> Self {
         Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], 12221)),
+            dead_after_s: default_dead_after_s(),
         }
     }
 }

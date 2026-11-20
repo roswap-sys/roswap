@@ -7,6 +7,15 @@ pub const RS_CMD_NODE_ADD: u8 = 1;
 pub const RS_CMD_CHUNK_ADD: u8 = 2;
 pub const RS_CMD_CHUNK_UPDATE: u8 = 3;
 pub const RS_CMD_GET_STATS: u8 = 4;
+pub const RS_CMD_NODE_DEL: u8 = 5;
+pub const RS_CMD_NODE_SET_STATE: u8 = 6;
+pub const RS_CMD_CHUNK_RETIRE: u8 = 7;
+pub const RS_EVT_NODE_STATE: u8 = 8;
+pub const RS_EVT_DATA_LOST: u8 = 9;
+
+pub const RS_NODE_UP: u32 = 0;
+pub const RS_NODE_SUSPECT: u32 = 1;
+pub const RS_NODE_DEAD: u32 = 2;
 
 pub const RS_A_NODE_ID: u16 = 1;
 pub const RS_A_ADDR: u16 = 2;
@@ -21,6 +30,13 @@ pub const RS_A_FREE_EXTENTS: u16 = 10;
 pub const RS_A_NR_NODES: u16 = 11;
 pub const RS_A_NR_CHUNKS: u16 = 12;
 pub const RS_A_LINKS_UP: u16 = 13;
+pub const RS_A_HB_RADDR: u16 = 14;
+pub const RS_A_HB_RKEY: u16 = 15;
+pub const RS_A_NODE_STATE: u16 = 16;
+pub const RS_A_BOOT_ID: u16 = 17;
+pub const RS_A_DEGRADED: u16 = 18;
+pub const RS_A_LOST: u16 = 19;
+pub const RS_A_NODE_LIST: u16 = 20;
 
 const AF_NETLINK: i32 = 16;
 const SOCK_RAW: i32 = 3;
@@ -29,6 +45,11 @@ const GENL_ID_CTRL: u16 = 0x10;
 const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
 const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+const SOL_NETLINK: i32 = 270;
+const NETLINK_ADD_MEMBERSHIP: i32 = 1;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLMSG_ERROR: u16 = 2;
@@ -49,6 +70,13 @@ extern "C" {
     fn send(sockfd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
     fn recv(sockfd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
     fn close(fd: i32) -> i32;
+    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const u32, optlen: u32) -> i32;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeInfo {
+    pub id: u16,
+    pub state: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +87,29 @@ pub struct KernelStats {
     pub nr_nodes: u32,
     pub nr_chunks: u32,
     pub links_up: u32,
+    pub degraded_slots: u32,
+    pub lost_slots: u32,
+    pub nodes: Vec<NodeInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeHb {
+    pub raddr: u64,
+    pub rkey: u32,
+    pub boot_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelEvent {
+    NodeState {
+        node_id: u16,
+        state: u32,
+        boot_id: u64,
+    },
+    DataLost {
+        node_id: u16,
+        lost: u32,
+    },
 }
 
 pub struct GenlClient {
@@ -92,11 +143,77 @@ impl GenlClient {
         })
     }
 
-    pub fn node_add(&mut self, node_id: u16, addr: &str) -> io::Result<()> {
+    pub fn node_add(&mut self, node_id: u16, addr: &str, hb: Option<&NodeHb>) -> io::Result<()> {
         self.command(RS_CMD_NODE_ADD, |msg| {
             msg.put_u16(RS_A_NODE_ID, node_id);
             msg.put_str(RS_A_ADDR, addr);
+            if let Some(hb) = hb {
+                msg.put_u64(RS_A_HB_RADDR, hb.raddr);
+                msg.put_u32(RS_A_HB_RKEY, hb.rkey);
+                msg.put_u64(RS_A_BOOT_ID, hb.boot_id);
+            }
         })
+    }
+
+    pub fn node_del(&mut self, node_id: u16) -> io::Result<()> {
+        self.command(RS_CMD_NODE_DEL, |msg| msg.put_u16(RS_A_NODE_ID, node_id))
+    }
+
+    pub fn node_set_state(&mut self, node_id: u16, state: u32) -> io::Result<()> {
+        self.command(RS_CMD_NODE_SET_STATE, |msg| {
+            msg.put_u16(RS_A_NODE_ID, node_id);
+            msg.put_u32(RS_A_NODE_STATE, state);
+        })
+    }
+
+    pub fn chunk_retire(&mut self, node_id: u16, gid: u32) -> io::Result<()> {
+        self.command(RS_CMD_CHUNK_RETIRE, |msg| {
+            msg.put_u16(RS_A_NODE_ID, node_id);
+            msg.put_u32(RS_A_CHUNK_GID, gid);
+        })
+    }
+
+    pub fn join_events(&mut self) -> io::Result<()> {
+        let payload = self.ctrl_getfamily()?;
+        let attrs = parse_attrs(&payload);
+        let id = attr_u16(&attrs, CTRL_ATTR_FAMILY_ID)?;
+        let group = event_group_id(&payload)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "roswap events group"))?;
+        let rc = unsafe {
+            setsockopt(
+                self.fd,
+                SOL_NETLINK,
+                NETLINK_ADD_MEMBERSHIP,
+                &group,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.family = Some(id);
+        Ok(())
+    }
+
+    pub fn wait_event(&mut self, timeout_ms: i32) -> io::Result<Option<KernelEvent>> {
+        let mut pfd = crate::sys::pollfd {
+            fd: self.fd,
+            events: crate::sys::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { crate::sys::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        let mut storage = vec![0u8; 8192];
+        let n = unsafe { recv(self.fd, storage.as_mut_ptr(), storage.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(parse_event(&storage[..n as usize]))
     }
 
     pub fn chunk_add(
@@ -158,6 +275,13 @@ impl GenlClient {
         if let Some(id) = self.family {
             return Ok(id);
         }
+        let payload = self.ctrl_getfamily()?;
+        let id = attr_u16(&parse_attrs(&payload), CTRL_ATTR_FAMILY_ID)?;
+        self.family = Some(id);
+        Ok(id)
+    }
+
+    fn ctrl_getfamily(&mut self) -> io::Result<Vec<u8>> {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
         let mut msg = Msg::new(
@@ -168,11 +292,7 @@ impl GenlClient {
         );
         msg.put_str(CTRL_ATTR_FAMILY_NAME, "roswap");
         msg.finish();
-        let payload = self.talk(GENL_ID_CTRL, seq, &msg.buf)?;
-        let attrs = parse_attrs(&payload);
-        let id = attr_u16(&attrs, CTRL_ATTR_FAMILY_ID)?;
-        self.family = Some(id);
-        Ok(id)
+        self.talk(GENL_ID_CTRL, seq, &msg.buf)
     }
 
     fn talk(&self, expect_type: u16, seq: u32, buf: &[u8]) -> io::Result<Vec<u8>> {
@@ -200,6 +320,7 @@ impl Drop for GenlClient {
     }
 }
 
+#[derive(Clone)]
 struct Msg {
     buf: Vec<u8>,
 }
@@ -297,7 +418,73 @@ fn stats_from_payload(payload: &[u8]) -> io::Result<KernelStats> {
         nr_nodes: attr_u32(&attrs, RS_A_NR_NODES)?,
         nr_chunks: attr_u32(&attrs, RS_A_NR_CHUNKS)?,
         links_up: attr_u32(&attrs, RS_A_LINKS_UP)?,
+        degraded_slots: attr_u32(&attrs, RS_A_DEGRADED)?,
+        lost_slots: attr_u32(&attrs, RS_A_LOST)?,
+        nodes: node_list(&attrs)?,
     })
+}
+
+fn node_list(attrs: &[(u16, Vec<u8>)]) -> io::Result<Vec<NodeInfo>> {
+    let Some((_, bytes)) = attrs.iter().find(|(attr, _)| *attr == RS_A_NODE_LIST) else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() % 4 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "node list length",
+        ));
+    }
+    let mut nodes = Vec::with_capacity(bytes.len() / 4);
+    for item in bytes.as_chunks::<4>().0 {
+        nodes.push(NodeInfo {
+            id: u16::from_le_bytes([item[0], item[1]]),
+            state: u32::from(item[2]),
+        });
+    }
+    Ok(nodes)
+}
+
+fn event_group_id(payload: &[u8]) -> Option<u32> {
+    let attrs = parse_attrs(payload);
+    let (_, groups) = attrs
+        .iter()
+        .find(|(attr, _)| *attr == CTRL_ATTR_MCAST_GROUPS)?;
+    for (_, body) in parse_attrs(groups) {
+        let inner = parse_attrs(&body);
+        let name = inner
+            .iter()
+            .find(|(attr, _)| *attr == CTRL_ATTR_MCAST_GRP_NAME)
+            .map(|(_, data)| data.as_slice());
+        if name != Some(b"events\0") {
+            continue;
+        }
+        return attr_u32(&inner, CTRL_ATTR_MCAST_GRP_ID).ok();
+    }
+    None
+}
+
+fn parse_event(buf: &[u8]) -> Option<KernelEvent> {
+    if buf.len() < NLMSG_HDRLEN + GENL_HDRLEN {
+        return None;
+    }
+    let len = u32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
+    if len < NLMSG_HDRLEN + GENL_HDRLEN || len > buf.len() {
+        return None;
+    }
+    let attrs = parse_attrs(&buf[NLMSG_HDRLEN + GENL_HDRLEN..len]);
+    let node_id = attr_u16(&attrs, RS_A_NODE_ID).ok()?;
+    match buf[NLMSG_HDRLEN] {
+        RS_EVT_NODE_STATE => Some(KernelEvent::NodeState {
+            node_id,
+            state: attr_u32(&attrs, RS_A_NODE_STATE).ok()?,
+            boot_id: attr_u64(&attrs, RS_A_BOOT_ID).unwrap_or(0),
+        }),
+        RS_EVT_DATA_LOST => Some(KernelEvent::DataLost {
+            node_id,
+            lost: attr_u32(&attrs, RS_A_LOST).ok()?,
+        }),
+        _ => None,
+    }
 }
 
 fn parse_attrs(mut payload: &[u8]) -> Vec<(u16, Vec<u8>)> {
@@ -328,6 +515,18 @@ fn attr_u16(attrs: &[(u16, Vec<u8>)], id: u16) -> io::Result<u16> {
         .try_into()
         .map(u16::from_ne_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short u16 attribute"))
+}
+
+fn attr_u64(attrs: &[(u16, Vec<u8>)], id: u16) -> io::Result<u64> {
+    let bytes = attrs
+        .iter()
+        .find(|(attr, _)| *attr == id)
+        .map(|(_, data)| data.as_slice())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing u64 attribute"))?;
+    bytes
+        .try_into()
+        .map(u64::from_ne_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short u64 attribute"))
 }
 
 fn attr_u32(attrs: &[(u16, Vec<u8>)], id: u16) -> io::Result<u32> {
@@ -380,9 +579,14 @@ mod tests {
                 RS_CMD_NODE_ADD,
                 RS_CMD_CHUNK_ADD,
                 RS_CMD_CHUNK_UPDATE,
-                RS_CMD_GET_STATS
+                RS_CMD_GET_STATS,
+                RS_CMD_NODE_DEL,
+                RS_CMD_NODE_SET_STATE,
+                RS_CMD_CHUNK_RETIRE,
+                RS_EVT_NODE_STATE,
+                RS_EVT_DATA_LOST,
             ],
-            [1, 2, 3, 4]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         assert_eq!(RS_A_NODE_ID, 1);
         assert_eq!(RS_A_ADDR, 2);
@@ -392,6 +596,14 @@ mod tests {
         assert_eq!(RS_A_RKEY, 6);
         assert_eq!(RS_A_CHUNK_MB, 7);
         assert_eq!(RS_A_LINKS_UP, 13);
+        assert_eq!(RS_A_HB_RADDR, 14);
+        assert_eq!(RS_A_HB_RKEY, 15);
+        assert_eq!(RS_A_NODE_STATE, 16);
+        assert_eq!(RS_A_BOOT_ID, 17);
+        assert_eq!(RS_A_DEGRADED, 18);
+        assert_eq!(RS_A_LOST, 19);
+        assert_eq!(RS_A_NODE_LIST, 20);
+        assert_eq!([RS_NODE_UP, RS_NODE_SUSPECT, RS_NODE_DEAD], [0, 1, 2]);
         assert_eq!(GENL_ID_CTRL, 0x10);
         assert_eq!(CTRL_CMD_GETFAMILY, 3);
     }
@@ -514,6 +726,11 @@ mod tests {
         assert!(stats_from_payload(payload(&msg)).is_err());
         msg.put_u32(RS_A_LINKS_UP, 4);
         msg.finish();
+        assert!(stats_from_payload(payload(&msg)).is_err());
+        msg.put_u32(RS_A_DEGRADED, 5);
+        msg.put_u32(RS_A_LOST, 6);
+        msg.put_bytes(99, &[1, 2, 3, 4]);
+        msg.finish();
         assert_eq!(
             stats_from_payload(payload(&msg)).unwrap(),
             KernelStats {
@@ -523,8 +740,114 @@ mod tests {
                 nr_nodes: 2,
                 nr_chunks: 2,
                 links_up: 4,
+                degraded_slots: 5,
+                lost_slots: 6,
+                nodes: Vec::new(),
             }
         );
+        let mut bad = msg.clone();
+        bad.put_bytes(RS_A_NODE_LIST, &[2, 0, 1, 0, 9]);
+        bad.finish();
+        assert!(stats_from_payload(payload(&bad)).is_err());
+        msg.put_bytes(RS_A_NODE_LIST, &[2, 0, 1, 0, 4, 1, 2, 0]);
+        msg.finish();
+        let stats = stats_from_payload(payload(&msg)).unwrap();
+        assert_eq!(
+            stats.nodes,
+            vec![
+                NodeInfo { id: 2, state: 1 },
+                NodeInfo {
+                    id: 0x0104,
+                    state: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn heartbeat_attributes_and_events_roundtrip() {
+        let hb = NodeHb {
+            raddr: 0x1000,
+            rkey: 7,
+            boot_id: 9,
+        };
+        let mut msg = Msg::new(9, NLM_F_REQUEST | NLM_F_ACK, 1, RS_CMD_NODE_ADD);
+        msg.put_u16(RS_A_NODE_ID, 3);
+        msg.put_str(RS_A_ADDR, "10.0.0.3:1");
+        msg.put_u64(RS_A_HB_RADDR, hb.raddr);
+        msg.put_u32(RS_A_HB_RKEY, hb.rkey);
+        msg.put_u64(RS_A_BOOT_ID, hb.boot_id);
+        msg.finish();
+        let attrs = parse_attrs(payload(&msg));
+        assert_eq!(attr_u64(&attrs, RS_A_HB_RADDR).unwrap(), 0x1000);
+        assert_eq!(attr_u32(&attrs, RS_A_HB_RKEY).unwrap(), 7);
+        assert!(attr_u64(&[(RS_A_BOOT_ID, vec![1, 2])], RS_A_BOOT_ID).is_err());
+
+        let mut event = Msg::new(9, 0, 0, RS_EVT_NODE_STATE);
+        event.put_u16(RS_A_NODE_ID, 3);
+        event.put_u32(RS_A_NODE_STATE, RS_NODE_SUSPECT);
+        event.put_u64(RS_A_BOOT_ID, 11);
+        event.finish();
+        assert_eq!(
+            parse_event(&event.buf),
+            Some(KernelEvent::NodeState {
+                node_id: 3,
+                state: RS_NODE_SUSPECT,
+                boot_id: 11,
+            })
+        );
+        let mut lost = Msg::new(9, 0, 0, RS_EVT_DATA_LOST);
+        lost.put_u16(RS_A_NODE_ID, 3);
+        lost.put_u32(RS_A_LOST, 4);
+        lost.finish();
+        assert_eq!(
+            parse_event(&lost.buf),
+            Some(KernelEvent::DataLost {
+                node_id: 3,
+                lost: 4,
+            })
+        );
+        assert_eq!(parse_event(&[0, 1, 2]), None);
+
+        let mut inner = Msg::new(0, 0, 0, 0);
+        inner.put_str(CTRL_ATTR_MCAST_GRP_NAME, "events");
+        inner.put_u32(CTRL_ATTR_MCAST_GRP_ID, 12);
+        let mut wrapped = Msg::new(0, 0, 0, 0);
+        wrapped.put_bytes(1, payload(&inner));
+        let mut groups = Msg::new(0x10, 0, 1, CTRL_CMD_GETFAMILY);
+        groups.put_bytes(CTRL_ATTR_MCAST_GROUPS, payload(&wrapped));
+        groups.finish();
+        assert_eq!(event_group_id(payload(&groups)), Some(12));
+        assert_eq!(event_group_id(&[]), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn kernel_rejects_illegal_netlink() {
+        let mut client = GenlClient::open().expect("netlink");
+        client
+            .node_add(9, "127.0.0.1:18619", None)
+            .expect("first add");
+        client
+            .node_add(9, "127.0.0.1:18619", None)
+            .expect("same address is idempotent");
+        let changed = client
+            .node_add(9, "127.0.0.1:18620", None)
+            .expect_err("address change");
+        assert!(is_already_exists(&changed));
+        let missing = client
+            .node_set_state(65000, RS_NODE_SUSPECT)
+            .expect_err("unknown node");
+        assert_eq!(missing.raw_os_error(), Some(2));
+        let retired = client.chunk_retire(65000, 1).expect_err("unknown chunk");
+        assert_eq!(retired.raw_os_error(), Some(2));
+        let short = client
+            .command(RS_CMD_NODE_SET_STATE, |msg| {
+                msg.put_bytes(RS_A_NODE_ID, &[1]);
+                msg.put_u32(RS_A_NODE_STATE, RS_NODE_DEAD);
+            })
+            .expect_err("short attribute");
+        assert_eq!(short.raw_os_error(), Some(22));
     }
 
     #[test]

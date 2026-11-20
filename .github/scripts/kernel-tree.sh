@@ -88,7 +88,7 @@ merge_fragment() {
 
 require_options() {
 	local dir=$1 opt
-	for opt in MODULES INFINIBAND INFINIBAND_ADDR_TRANS RDMA_RXE SWAP; do
+	for opt in MODULES INFINIBAND INFINIBAND_ADDR_TRANS RDMA_RXE SWAP PROVE_LOCKING DEBUG_ATOMIC_SLEEP; do
 		grep -q "^CONFIG_${opt}=[ym]" "$dir/.config" || die "$dir/.config does not enable CONFIG_${opt}"
 	done
 }
