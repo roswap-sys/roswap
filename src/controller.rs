@@ -471,17 +471,83 @@ fn note_hb(node: &mut NodeState, hb: NodeHb) {
     }
 }
 
-pub struct Controller {
-    registry: Registry,
-    genl: GenlClient,
+pub trait KernelControl: Send {
+    fn node_add(&mut self, node_id: u16, addr: &str, hb: Option<&NodeHb>) -> io::Result<()>;
+    fn chunk_add(
+        &mut self,
+        node_id: u16,
+        gid: u32,
+        epoch: u32,
+        raddr: u64,
+        rkey: u32,
+        size_mb: u32,
+    ) -> io::Result<()>;
+    fn chunk_update(
+        &mut self,
+        node_id: u16,
+        gid: u32,
+        epoch: u32,
+        raddr: u64,
+        rkey: u32,
+    ) -> io::Result<()>;
+    fn node_set_state(&mut self, node_id: u16, state: u32) -> io::Result<()>;
+    fn chunk_retire(&mut self, node_id: u16, gid: u32) -> io::Result<()>;
 }
 
-impl Controller {
+impl KernelControl for GenlClient {
+    fn node_add(&mut self, node_id: u16, addr: &str, hb: Option<&NodeHb>) -> io::Result<()> {
+        GenlClient::node_add(self, node_id, addr, hb)
+    }
+
+    fn chunk_add(
+        &mut self,
+        node_id: u16,
+        gid: u32,
+        epoch: u32,
+        raddr: u64,
+        rkey: u32,
+        size_mb: u32,
+    ) -> io::Result<()> {
+        GenlClient::chunk_add(self, node_id, gid, epoch, raddr, rkey, size_mb)
+    }
+
+    fn chunk_update(
+        &mut self,
+        node_id: u16,
+        gid: u32,
+        epoch: u32,
+        raddr: u64,
+        rkey: u32,
+    ) -> io::Result<()> {
+        GenlClient::chunk_update(self, node_id, gid, epoch, raddr, rkey)
+    }
+
+    fn node_set_state(&mut self, node_id: u16, state: u32) -> io::Result<()> {
+        GenlClient::node_set_state(self, node_id, state)
+    }
+
+    fn chunk_retire(&mut self, node_id: u16, gid: u32) -> io::Result<()> {
+        GenlClient::chunk_retire(self, node_id, gid)
+    }
+}
+
+pub struct Controller<K: KernelControl = GenlClient> {
+    registry: Registry,
+    kernel: K,
+}
+
+impl Controller<GenlClient> {
     pub fn open() -> io::Result<Self> {
-        Ok(Self {
+        Ok(Self::new(GenlClient::open()?))
+    }
+}
+
+impl<K: KernelControl> Controller<K> {
+    pub fn new(kernel: K) -> Self {
+        Self {
             registry: Registry::default(),
-            genl: GenlClient::open()?,
-        })
+            kernel,
+        }
     }
 
     pub fn set_dead_after_s(&mut self, secs: u64) {
@@ -512,7 +578,7 @@ impl Controller {
             match &op {
                 KernelOp::NodeAdd { node_id, addr } => {
                     let hb = self.registry.heartbeat_of(*node_id);
-                    self.genl.node_add(*node_id, addr, hb.as_ref())?;
+                    self.kernel.node_add(*node_id, addr, hb.as_ref())?;
                 }
                 KernelOp::ChunkAdd {
                     node_id,
@@ -523,13 +589,13 @@ impl Controller {
                     size_mb,
                 } => {
                     if let Err(err) = self
-                        .genl
+                        .kernel
                         .chunk_add(*node_id, *gid, *epoch, *raddr, *rkey, *size_mb)
                     {
                         if !is_already_exists(&err) {
                             return Err(err);
                         }
-                        self.genl
+                        self.kernel
                             .chunk_update(*node_id, *gid, *epoch, *raddr, *rkey)?;
                     }
                 }
@@ -540,23 +606,42 @@ impl Controller {
                     raddr,
                     rkey,
                 } => self
-                    .genl
+                    .kernel
                     .chunk_update(*node_id, *gid, *epoch, *raddr, *rkey)?,
                 KernelOp::NodeSetState { node_id, state } => {
-                    self.genl.node_set_state(*node_id, *state)?;
+                    self.kernel.node_set_state(*node_id, *state)?;
                 }
                 KernelOp::ChunkRetire { node_id, gid } => {
-                    self.genl.chunk_retire(*node_id, *gid)?;
+                    self.kernel.chunk_retire(*node_id, *gid)?;
                 }
             }
             self.registry.commit(&op);
         }
         Ok(())
     }
+
+    fn apply_event(&mut self, event: KernelEvent) -> io::Result<()> {
+        match event {
+            KernelEvent::NodeState {
+                node_id,
+                state,
+                boot_id,
+            } => {
+                self.registry.note_kernel(node_id, state, boot_id, now_ms());
+                self.sync_kernel()
+            }
+            KernelEvent::DataLost { .. } => Ok(()),
+        }
+    }
+
+    fn apply_eval(&mut self) -> io::Result<()> {
+        self.registry.evaluate(now_ms());
+        self.sync_kernel()
+    }
 }
 
-struct Svc {
-    controller: Arc<Mutex<Controller>>,
+struct Svc<K: KernelControl> {
+    controller: Arc<Mutex<Controller<K>>>,
 }
 
 fn chunks_from(descs: &[ChunkDesc]) -> Vec<ChunkReport> {
@@ -573,7 +658,7 @@ fn chunks_from(descs: &[ChunkDesc]) -> Vec<ChunkReport> {
 }
 
 #[tonic::async_trait]
-impl ClusterService for Svc {
+impl<K: KernelControl + 'static> ClusterService for Svc<K> {
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
         let req = request.into_inner();
         let node_id =
@@ -635,7 +720,7 @@ impl ClusterService for Svc {
     }
 }
 
-impl Svc {
+impl<K: KernelControl> Svc<K> {
     fn push(
         &self,
         node_id: u32,
@@ -674,7 +759,7 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn run(cfg: &ControllerConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
-    let controller = Arc::new(Mutex::new(Controller::open()?));
+    let controller = Arc::new(Mutex::new(Controller::<GenlClient>::open()?));
     controller
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -735,16 +820,9 @@ fn event_loop(controller: Arc<Mutex<Controller>>, stop: Arc<AtomicBool>, halt: A
         }
         while !stopped(&stop, &halt) {
             match events.wait_event(200) {
-                Ok(Some(KernelEvent::NodeState {
-                    node_id,
-                    state,
-                    boot_id,
-                })) => {
+                Ok(Some(event @ KernelEvent::NodeState { .. })) => {
                     let mut guard = controller.lock().unwrap_or_else(|err| err.into_inner());
-                    guard
-                        .registry
-                        .note_kernel(node_id, state, boot_id, now_ms());
-                    if let Err(err) = guard.sync_kernel() {
+                    if let Err(err) = guard.apply_event(event) {
                         if err.raw_os_error() != Some(2) {
                             warn!("kernel sync after node event failed: {err}");
                         }
@@ -767,8 +845,7 @@ fn eval_loop(controller: Arc<Mutex<Controller>>, stop: Arc<AtomicBool>, halt: Ar
     while !stopped(&stop, &halt) {
         thread::sleep(Duration::from_millis(200));
         let mut guard = controller.lock().unwrap_or_else(|err| err.into_inner());
-        guard.registry.evaluate(now_ms());
-        if let Err(err) = guard.sync_kernel() {
+        if let Err(err) = guard.apply_eval() {
             if err.raw_os_error() != Some(2) {
                 warn!("kernel sync after dead check failed: {err}");
             }
@@ -1246,5 +1323,157 @@ mod tests {
             .pending()
             .iter()
             .all(|op| !matches!(op, KernelOp::NodeAdd { .. })));
+    }
+
+    #[derive(Default)]
+    struct Scripted {
+        log: Vec<String>,
+        add_errno: Option<i32>,
+        update_errno: Option<i32>,
+        state_errno: Option<i32>,
+    }
+
+    impl KernelControl for Scripted {
+        fn node_add(&mut self, node_id: u16, addr: &str, hb: Option<&NodeHb>) -> io::Result<()> {
+            self.log
+                .push(format!("add {node_id} {addr} {}", hb.is_some()));
+            Ok(())
+        }
+
+        fn chunk_add(
+            &mut self,
+            node_id: u16,
+            gid: u32,
+            _epoch: u32,
+            _raddr: u64,
+            rkey: u32,
+            _size_mb: u32,
+        ) -> io::Result<()> {
+            self.log.push(format!("chunk-add {node_id} {gid} {rkey}"));
+            if let Some(errno) = self.add_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            Ok(())
+        }
+
+        fn chunk_update(
+            &mut self,
+            node_id: u16,
+            gid: u32,
+            _epoch: u32,
+            _raddr: u64,
+            rkey: u32,
+        ) -> io::Result<()> {
+            self.log
+                .push(format!("chunk-update {node_id} {gid} {rkey}"));
+            if let Some(errno) = self.update_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            Ok(())
+        }
+
+        fn node_set_state(&mut self, node_id: u16, state: u32) -> io::Result<()> {
+            self.log.push(format!("state {node_id} {state}"));
+            if let Some(errno) = self.state_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            Ok(())
+        }
+
+        fn chunk_retire(&mut self, node_id: u16, gid: u32) -> io::Result<()> {
+            self.log.push(format!("retire {node_id} {gid}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn existing_chunk_add_falls_back_to_update_and_commits() {
+        let mut controller = Controller::new(Scripted {
+            add_errno: Some(17),
+            ..Scripted::default()
+        });
+        controller
+            .registry
+            .upsert(2, 3, "10.0.0.2:18515", &[chunk(0, 9)]);
+        controller.sync_kernel().unwrap();
+        assert_eq!(
+            controller.kernel.log,
+            vec![
+                "add 2 10.0.0.2:18515 false".to_string(),
+                "chunk-add 2 0 9".to_string(),
+                "chunk-update 2 0 9".to_string(),
+            ]
+        );
+        assert!(controller.registry.pending().is_empty());
+        assert!(controller.registry.views()[0].kernel_synced);
+    }
+
+    #[test]
+    fn a_failed_kernel_call_does_not_commit() {
+        let mut controller = Controller::new(Scripted {
+            add_errno: Some(5),
+            ..Scripted::default()
+        });
+        controller
+            .registry
+            .upsert(2, 3, "10.0.0.2:18515", &[chunk(0, 9)]);
+        let err = controller.sync_kernel().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert!(controller
+            .registry
+            .pending()
+            .iter()
+            .any(|op| matches!(op, KernelOp::ChunkAdd { gid: 0, .. })));
+        assert!(!controller.registry.views()[0].kernel_synced);
+
+        let mut update_fails = Controller::new(Scripted {
+            add_errno: Some(17),
+            update_errno: Some(5),
+            ..Scripted::default()
+        });
+        update_fails
+            .registry
+            .upsert(2, 3, "10.0.0.2:18515", &[chunk(0, 9)]);
+        assert!(update_fails.sync_kernel().is_err());
+        assert!(!update_fails.registry.views()[0].kernel_synced);
+    }
+
+    #[test]
+    fn event_and_eval_drive_dead_through_the_kernel() {
+        let mut controller = Controller::new(Scripted::default());
+        live(&mut controller.registry, 1, 4, 8);
+        controller.kernel.log.clear();
+        controller
+            .apply_event(KernelEvent::NodeState {
+                node_id: 1,
+                state: crate::genl::RS_NODE_SUSPECT,
+                boot_id: 99,
+            })
+            .unwrap();
+        assert!(controller.registry.condemned(1));
+        assert!(controller
+            .kernel
+            .log
+            .iter()
+            .any(|line| line.starts_with("state 1 2")));
+        assert!(controller.registry.pending().is_empty());
+
+        let mut timed = Controller::new(Scripted {
+            state_errno: Some(5),
+            ..Scripted::default()
+        });
+        live(&mut timed.registry, 1, 4, 8);
+        timed
+            .registry
+            .note_kernel(1, crate::genl::RS_NODE_SUSPECT, 0, 0);
+        assert!(timed.apply_eval().is_err());
+        assert!(timed.registry.condemned(1));
+        assert!(timed.registry.pending().iter().any(|op| matches!(
+            op,
+            KernelOp::NodeSetState {
+                state: crate::genl::RS_NODE_DEAD,
+                ..
+            }
+        )));
     }
 }

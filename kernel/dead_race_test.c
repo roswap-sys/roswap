@@ -113,7 +113,7 @@ static void test_kill_versus_commit(void)
 	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "nodes");
 	expect(rs_map_chunk_add(1, 0, 1, 0x100000000ULL, 1, 8) == 0, "node 1");
 	expect(rs_map_chunk_add(2, 0, 1, 0x200000000ULL, 2, 8) == 0, "node 2");
-	alarm(3);
+	alarm(30);
 	for (i = 0; i < 2; i++)
 		expect(pthread_create(&io[i], NULL, io_thread, &jobs[i]) == 0, "io");
 	usleep(1000);
@@ -134,6 +134,47 @@ static void test_kill_versus_commit(void)
 	rs_map_exit();
 }
 
+static void *update_thread(void *arg)
+{
+	u32 i;
+
+	(void)arg;
+	for (i = 0; i < 50; i++) {
+		rs_map_chunk_update(2, 0, 1 + (i & 1), 0x200000000ULL + ((u64)i << 12),
+				    20 + i);
+		usleep(50);
+	}
+	rs_map_node_kill(2, NULL);
+	return NULL;
+}
+
+static void test_update_versus_kill(void)
+{
+	struct io_job jobs[2] = {
+		{ .base = 0, .n = 32, .cpu = 0 },
+		{ .base = 32, .n = 32, .cpu = 1 },
+	};
+	pthread_t io[2], update;
+	int i;
+
+	expect(rs_map_init(1) == 0, "init");
+	expect(rs_map_set_protection(RS_PROT_REPLICA2) == 0, "replica2");
+	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "nodes");
+	expect(rs_map_chunk_add(1, 0, 1, 0x100000000ULL, 1, 8) == 0, "node 1");
+	expect(rs_map_chunk_add(2, 0, 1, 0x200000000ULL, 2, 8) == 0, "node 2");
+	alarm(30);
+	for (i = 0; i < 2; i++)
+		expect(pthread_create(&io[i], NULL, io_thread, &jobs[i]) == 0, "io");
+	expect(pthread_create(&update, NULL, update_thread, NULL) == 0, "update");
+	for (i = 0; i < 2; i++)
+		expect(pthread_join(io[i], NULL) == 0, "join io");
+	expect(pthread_join(update, NULL) == 0, "join update");
+	alarm(0);
+	expect(rs_map_node_state(2) == RS_NODE_DEAD, "update ended dead");
+	check_dead_invariant(2);
+	rs_map_exit();
+}
+
 static void test_flip_versus_place(void)
 {
 	struct io_job job = { .base = 0, .n = 16, .cpu = 0 };
@@ -145,7 +186,7 @@ static void test_flip_versus_place(void)
 	expect(rs_map_node_add(1) == 0 && rs_map_node_add(2) == 0, "nodes");
 	expect(rs_map_chunk_add(1, 0, 1, 0x100000000ULL, 1, 4) == 0, "node 1");
 	expect(rs_map_chunk_add(2, 0, 1, 0x200000000ULL, 2, 4) == 0, "node 2");
-	alarm(3);
+	alarm(30);
 	expect(pthread_create(&io, NULL, io_thread, &job) == 0, "io");
 	expect(pthread_create(&flip, NULL, flip_thread, NULL) == 0, "flip");
 	expect(pthread_join(io, NULL) == 0, "join io");
@@ -171,6 +212,7 @@ int main(void)
 		return 2;
 	test_kill_versus_commit();
 	test_flip_versus_place();
+	test_update_versus_kill();
 	if (failures) {
 		fprintf(stderr, "%d failures\n", failures);
 		return 1;

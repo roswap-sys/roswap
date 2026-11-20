@@ -66,12 +66,18 @@ MODULE_PARM_DESC(qp_send_depth, "send WR depth of each RC QP");
 static char *local_addrs;
 static uint hb_interval_ms = 50;
 static uint hb_miss_limit = RS_HB_MISS_LIMIT;
+static uint read_hedge_us = ROSWAP_HEDGE_US;
+static atomic_t rs_hedge_sent;
+static atomic_t rs_hedge_won;
+static atomic_t rs_key_wait_hits;
 module_param(local_addrs, charp, 0444);
 MODULE_PARM_DESC(local_addrs, "comma-separated local RDMA IPv4 addresses");
 module_param(hb_interval_ms, uint, 0644);
 MODULE_PARM_DESC(hb_interval_ms, "heartbeat probe period in milliseconds");
 module_param(hb_miss_limit, uint, 0644);
 MODULE_PARM_DESC(hb_miss_limit, "missed probes before a node is suspect");
+module_param(read_hedge_us, uint, 0644);
+MODULE_PARM_DESC(read_hedge_us, "replica2 read hedge delay in microseconds");
 
 struct rs_dev {
 	struct ib_device *ibdev;
@@ -654,10 +660,13 @@ static bool rs_settle(struct roswap_cmd *cmd, u32 which, bool success, bool post
 			rs_credit_put(cmd->qp[which]);
 		if (cmd->use_bounce &&
 		    (act == RS_ACT_PUBLISH || act == RS_ACT_FAIL)) {
-			if (act == RS_ACT_PUBLISH)
+			if (act == RS_ACT_PUBLISH) {
 				WRITE_ONCE(cmd->publish_bounce, cmd->bounce[which]);
-			else
+				if (which == cmd->hedge_which)
+					atomic_inc(&rs_hedge_won);
+			} else {
 				WRITE_ONCE(cmd->publish_bounce, NULL);
+			}
 			queue_work(roswap_io, &cmd->done_work);
 			return true;
 		}
@@ -695,8 +704,10 @@ static void rs_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
 				   cmd->dir == DMA_TO_DEVICE ? "write" : "read",
 				   ib_wc_status_msg(wc->status));
 		if (qp && rs_wc_permanent(wc->status) &&
-		    rs_map_chunk_gen(cmd->gid[wr->which]) == cmd->gen[wr->which])
+		    rs_map_chunk_gen(cmd->gid[wr->which]) == cmd->gen[wr->which]) {
 			WRITE_ONCE(qp->link->key_wait, true);
+			atomic_inc(&rs_key_wait_hits);
+		}
 		rs_link_failed(qp ? qp->link : NULL);
 	}
 	rs_settle(cmd, wr->which, ok, true);
@@ -787,8 +798,15 @@ static void rs_bounce_done(struct ib_cq *cq, struct ib_wc *wc)
 		rs_bounce_free(bounce, true);
 		return;
 	}
-	if (!ok && wc->status != IB_WC_WR_FLUSH_ERR && bounce->qp)
+	if (!ok && wc->status != IB_WC_WR_FLUSH_ERR && bounce->qp) {
+		if (rs_wc_permanent(wc->status) &&
+		    rs_map_chunk_gen(cmd->gid[bounce->which]) ==
+		    cmd->gen[bounce->which]) {
+			WRITE_ONCE(bounce->qp->link->key_wait, true);
+			atomic_inc(&rs_key_wait_hits);
+		}
 		rs_link_failed(bounce->qp->link);
+	}
 	rs_settle(cmd, bounce->which, ok, true);
 	if (READ_ONCE(cmd->publish_bounce) == bounce)
 		return;
@@ -858,7 +876,7 @@ static int rs_post_bounce(struct roswap_cmd *cmd, u32 which, u64 remote,
 	if (cmd->hedge_which < RS_NR_COPIES && which != cmd->hedge_which) {
 		WRITE_ONCE(cmd->hedge_armed, 1);
 		hrtimer_start(&cmd->hedge_timer,
-			      ns_to_ktime((u64)ROSWAP_HEDGE_US * NSEC_PER_USEC),
+			      ns_to_ktime((u64)read_hedge_us * NSEC_PER_USEC),
 			      HRTIMER_MODE_REL);
 	}
 	sge.addr = bounce->dma;
@@ -912,6 +930,8 @@ static void rs_hedge_work(struct work_struct *work)
 	if (rs_post_bounce(cmd, which, cmd->hedge_addr, cmd->hedge_rkey,
 			   cmd->qp[which], set))
 		rs_settle(cmd, which, false, false);
+	else
+		atomic_inc(&rs_hedge_sent);
 }
 
 static enum hrtimer_restart rs_hedge_timer(struct hrtimer *timer)
@@ -2213,6 +2233,21 @@ int roswap_chunk_update(u16 node_id, u32 local_gid, u32 epoch, u64 base,
 	return 0;
 }
 
+u32 roswap_hedge_sent(void)
+{
+	return atomic_read(&rs_hedge_sent);
+}
+
+u32 roswap_hedge_won(void)
+{
+	return atomic_read(&rs_hedge_won);
+}
+
+u32 roswap_key_wait_hits(void)
+{
+	return atomic_read(&rs_key_wait_hits);
+}
+
 int roswap_links_up(void)
 {
 	struct rs_link *link;
@@ -2240,21 +2275,37 @@ int roswap_links_up(void)
 	return n;
 }
 
+static bool rs_drop_one(const char *val, u16 *id)
+{
+	const char *p;
+
+	if (!val)
+		return false;
+	p = skip_spaces(val);
+	if (strncmp(p, "node=", 5))
+		return false;
+	return kstrtou16(skip_spaces(p + 5), 10, id) == 0;
+}
+
 static int rs_drop_set(const char *val, const struct kernel_param *kp)
 {
 	struct rs_link *link;
 	unsigned long idx = 0;
+	u16 id = 0;
+	bool one;
 
-	(void)val;
 	(void)kp;
+	one = rs_drop_one(val, &id);
 	rcu_read_lock();
 	for (;;) {
 		link = xa_find(&rs_links, &idx, ULONG_MAX, XA_PRESENT);
 		if (!link)
 			break;
-		WRITE_ONCE(link->force_down, true);
-		WRITE_ONCE(link->key_wait, false);
-		rs_link_failed(link);
+		if (!one || link->node_id == id) {
+			WRITE_ONCE(link->force_down, true);
+			WRITE_ONCE(link->key_wait, false);
+			rs_link_failed(link);
+		}
 		if (idx == ULONG_MAX)
 			break;
 		idx++;
@@ -2275,21 +2326,24 @@ static const struct kernel_param_ops rs_drop_ops = {
 };
 
 module_param_cb(drop_connection, &rs_drop_ops, NULL, 0200);
-MODULE_PARM_DESC(drop_connection, "write anything to drop the RC connections");
+MODULE_PARM_DESC(drop_connection, "drop RC links; node=<id> drops one node");
 
 static int rs_drop_hb_set(const char *val, const struct kernel_param *kp)
 {
 	struct rs_link *link;
 	unsigned long idx = 0;
+	u16 id = 0;
+	bool one;
 
-	(void)val;
 	(void)kp;
+	one = rs_drop_one(val, &id);
 	rcu_read_lock();
 	for (;;) {
 		link = xa_find(&rs_links, &idx, ULONG_MAX, XA_PRESENT);
 		if (!link)
 			break;
-		WRITE_ONCE(link->hb_drop, true);
+		if (!one || link->node_id == id)
+			WRITE_ONCE(link->hb_drop, true);
 		if (idx == ULONG_MAX)
 			break;
 		idx++;
@@ -2304,7 +2358,7 @@ static const struct kernel_param_ops rs_drop_hb_ops = {
 };
 
 module_param_cb(drop_heartbeat, &rs_drop_hb_ops, NULL, 0200);
-MODULE_PARM_DESC(drop_heartbeat, "write anything to tear heartbeat QPs down");
+MODULE_PARM_DESC(drop_heartbeat, "drop heartbeat QPs; node=<id> drops one");
 
 static void rs_stop_links(void)
 {

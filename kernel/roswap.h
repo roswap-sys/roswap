@@ -67,6 +67,9 @@ enum rs_genl_attr {
 	RS_A_LOST,
 	RS_A_NODE_LIST,
 	RS_A_PAD,
+	RS_A_HEDGE_SENT,
+	RS_A_HEDGE_WON,
+	RS_A_KEY_WAIT,
 	__RS_A_MAX,
 };
 #define RS_A_MAX (__RS_A_MAX - 1)
@@ -100,6 +103,9 @@ int roswap_chunk_update(u16 node_id, u32 local_gid, u32 epoch, u64 raddr,
 		      u32 rkey);
 int roswap_chunk_retire(u16 node_id, u32 local_gid);
 int roswap_links_up(void);
+u32 roswap_hedge_sent(void);
+u32 roswap_hedge_won(void);
+u32 roswap_key_wait_hits(void);
 void rs_genl_node_state(u16 node_id, u32 state, u64 boot_id);
 void rs_genl_data_lost(u16 node_id, u32 lost);
 int rs_genl_register(void);

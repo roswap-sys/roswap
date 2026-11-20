@@ -32,6 +32,9 @@ static const struct nla_policy rs_policy[RS_A_MAX + 1] = {
 	[RS_A_DEGRADED] = { .type = NLA_U32 },
 	[RS_A_LOST] = { .type = NLA_U32 },
 	[RS_A_NODE_LIST] = { .type = NLA_BINARY, .len = RS_MAX_NODES * 4 },
+	[RS_A_HEDGE_SENT] = { .type = NLA_U32 },
+	[RS_A_HEDGE_WON] = { .type = NLA_U32 },
+	[RS_A_KEY_WAIT] = { .type = NLA_U32 },
 };
 
 static const struct genl_multicast_group rs_mcgrps[] = {
@@ -195,7 +198,10 @@ static int rs_cmd_stats(struct sk_buff *skb, struct genl_info *info)
 	    rs_put_u32(msg, RS_A_NR_CHUNKS, st.nr_chunks) ||
 	    rs_put_u32(msg, RS_A_LINKS_UP, roswap_links_up()) ||
 	    rs_put_u32(msg, RS_A_DEGRADED, st.degraded_slots) ||
-	    rs_put_u32(msg, RS_A_LOST, st.lost_slots))
+	    rs_put_u32(msg, RS_A_LOST, st.lost_slots) ||
+	    rs_put_u32(msg, RS_A_HEDGE_SENT, roswap_hedge_sent()) ||
+	    rs_put_u32(msg, RS_A_HEDGE_WON, roswap_hedge_won()) ||
+	    rs_put_u32(msg, RS_A_KEY_WAIT, roswap_key_wait_hits()))
 		goto nospace;
 	if (nr) {
 		u8 *raw = kmalloc((size_t)nr * 4, GFP_KERNEL);

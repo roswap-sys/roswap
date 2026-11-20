@@ -43,7 +43,10 @@ jobs:
       run: make -C kernel KCFLAGS=-Werror
 
     - name: Map allocator tests
-      run: make -C kernel map-test
+      run: |
+        make -C kernel map-test
+        make -C kernel map-test-asan
+        make -C kernel map-test-tsan
 
   compat:
     name: build on ${{ matrix.kernel }}

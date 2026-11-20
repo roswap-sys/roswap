@@ -13,13 +13,25 @@ fn main() {
     let result = match cmd.as_deref() {
         Some("status") => kernel_status(),
         Some("cluster") => {
-            let addr = args
-                .next()
-                .unwrap_or_else(|| "http://127.0.0.1:12221".to_string());
-            cluster_status(&normalize_http(&addr))
+            let mut json = false;
+            let mut addr = None;
+            for arg in args {
+                if arg == "--json" {
+                    json = true;
+                } else if addr.is_none() {
+                    addr = Some(arg);
+                } else {
+                    eprintln!(
+                        "Usage: roswapctl status | roswapctl cluster [--json] [http://host:port]"
+                    );
+                    process::exit(2);
+                }
+            }
+            let addr = addr.unwrap_or_else(|| "http://127.0.0.1:12221".to_string());
+            cluster_status(&normalize_http(&addr), json)
         }
         _ => {
-            eprintln!("Usage: roswapctl status | roswapctl cluster [http://host:port]");
+            eprintln!("Usage: roswapctl status | roswapctl cluster [--json] [http://host:port]");
             process::exit(2);
         }
     };
@@ -38,7 +50,7 @@ fn kernel_status() -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(
         out,
-        "slots {} used {} free_extents {} nodes {} chunks {} links_up {} degraded {} lost {}",
+        "slots {} used {} free_extents {} nodes {} chunks {} links_up {} degraded {} lost {} hedge_sent {} hedge_won {} key_wait {}",
         stats.nr_slots,
         stats.used_slots,
         stats.free_extents,
@@ -46,7 +58,10 @@ fn kernel_status() -> io::Result<()> {
         stats.nr_chunks,
         stats.links_up,
         stats.degraded_slots,
-        stats.lost_slots
+        stats.lost_slots,
+        stats.hedge_sent,
+        stats.hedge_won,
+        stats.key_wait_hits
     )?;
     for node in &stats.nodes {
         let name = match node.state {
@@ -59,7 +74,20 @@ fn kernel_status() -> io::Result<()> {
     Ok(())
 }
 
-fn cluster_status(addr: &str) -> io::Result<()> {
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn cluster_status(addr: &str, json: bool) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -71,6 +99,37 @@ fn cluster_status(addr: &str) -> io::Result<()> {
             .await?
             .into_inner();
         let mut out = io::stdout().lock();
+        if json {
+            write!(out, "{{\"nodes\":[")?;
+            for (i, node) in response.nodes.iter().enumerate() {
+                if i > 0 {
+                    write!(out, ",")?;
+                }
+                write!(
+                    out,
+                    "{{\"node_id\":{},\"epoch\":{},\"listen\":\"{}\",\"synced\":{},\"state\":{},\"boot\":{},\"chunks\":[",
+                    node.node_id,
+                    node.node_epoch,
+                    json_escape(&node.listen_addr),
+                    if node.kernel_synced { "true" } else { "false" },
+                    node.node_state,
+                    node.boot_id_lo
+                )?;
+                for (j, chunk) in node.chunks.iter().enumerate() {
+                    if j > 0 {
+                        write!(out, ",")?;
+                    }
+                    write!(
+                        out,
+                        "{{\"gid\":{},\"epoch\":{},\"raddr\":{},\"rkey\":{},\"size_mb\":{}}}",
+                        chunk.gid, chunk.epoch, chunk.raddr, chunk.rkey, chunk.size_mb
+                    )?;
+                }
+                write!(out, "]}}")?;
+            }
+            writeln!(out, "]}}")?;
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if response.nodes.is_empty() {
             writeln!(out, "no nodes")?;
         }
@@ -108,7 +167,7 @@ fn normalize_http(addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_http;
+    use super::{json_escape, normalize_http};
 
     #[test]
     fn cluster_address_keeps_a_scheme_and_adds_http() {
@@ -122,5 +181,11 @@ mod tests {
         );
         assert_eq!(normalize_http("127.0.0.1:12221"), "http://127.0.0.1:12221");
         assert_eq!(normalize_http("[::1]:12221"), "http://[::1]:12221");
+    }
+
+    #[test]
+    fn json_escape_quotes_and_controls() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("line\n"), "line\\u000a");
     }
 }

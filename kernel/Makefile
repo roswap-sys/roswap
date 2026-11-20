@@ -19,18 +19,30 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 all:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
+MAP_CFLAGS := -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR)
+SAN_ASAN := -fsanitize=address,undefined -fno-omit-frame-pointer
+SAN_TSAN := -fsanitize=thread
+
 map-test:
-	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
-		$(CURDIR)/map_test.c -o /tmp/roswap-map-test
-	/tmp/roswap-map-test
-	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
-		$(CURDIR)/hedge_race_test.c -o /tmp/roswap-hedge-race
-	/tmp/roswap-hedge-race
-	gcc -std=c11 -Wall -Wextra -Werror -pthread -DRS_MAP_TEST -I$(CURDIR) \
-		$(CURDIR)/dead_race_test.c -o /tmp/roswap-dead-race
-	/tmp/roswap-dead-race
+	$(MAKE) -C $(CURDIR) map-test-run SUFFIX= EXTRA=
+
+map-test-asan:
+	$(MAKE) -C $(CURDIR) map-test-run SUFFIX=-asan EXTRA="$(SAN_ASAN)"
+
+map-test-tsan:
+	$(MAKE) -C $(CURDIR) map-test-run SUFFIX=-tsan EXTRA="$(SAN_TSAN)"
+
+map-test-run:
+	gcc $(MAP_CFLAGS) $(EXTRA) $(CURDIR)/map_test.c -o /tmp/roswap-map-test$(SUFFIX)
+	/tmp/roswap-map-test$(SUFFIX)
+	gcc $(MAP_CFLAGS) $(EXTRA) $(CURDIR)/hedge_race_test.c -o /tmp/roswap-hedge-race$(SUFFIX)
+	/tmp/roswap-hedge-race$(SUFFIX)
+	gcc $(MAP_CFLAGS) $(EXTRA) $(CURDIR)/dead_race_test.c -o /tmp/roswap-dead-race$(SUFFIX)
+	/tmp/roswap-dead-race$(SUFFIX)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
-	rm -f /tmp/roswap-map-test /tmp/roswap-hedge-race /tmp/roswap-dead-race
+	rm -f /tmp/roswap-map-test /tmp/roswap-hedge-race /tmp/roswap-dead-race \
+		/tmp/roswap-map-test-asan /tmp/roswap-hedge-race-asan /tmp/roswap-dead-race-asan \
+		/tmp/roswap-map-test-tsan /tmp/roswap-hedge-race-tsan /tmp/roswap-dead-race-tsan
 endif

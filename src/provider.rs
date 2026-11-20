@@ -3,7 +3,7 @@ use crate::chunk::{Chunk, HeartbeatPage};
 use crate::rdma::{
     admit_passive_qp, chunk_size_error, cm_event_drops_connection, device_max_qp, rdma_dev_ipv4,
     snapshot_cm_event, sockaddr_from_v4, CmEventView, ConnPrivateData, PassiveConnection,
-    RdmaDeviceContext,
+    QpPurpose, RdmaDeviceContext,
 };
 use crate::sys;
 use log::{debug, info, warn};
@@ -341,46 +341,34 @@ impl ProviderRuntime {
         client_id: NonNull<sys::rdma_cm_id>,
         pdata: Option<ConnPrivateData>,
     ) -> Result<(), String> {
-        let pdata = pdata.ok_or("missing rs_conn_pdata")?;
-        let purpose = pdata
-            .validate(Some(self.config.node_epoch))
-            .map_err(|e| e.to_string())?;
-        let chunk_bytes = self
-            .chunks
-            .first()
-            .map(|chunk| chunk.len())
-            .ok_or("no chunk exported")?;
-        if let Some(reason) = chunk_size_error(pdata.chunk_size_mb(), chunk_bytes) {
-            return Err(format!(
-                "{reason}: client {} MiB, provider {} MiB",
-                pdata.chunk_size_mb(),
-                chunk_bytes >> 20
-            ));
-        }
-        let cpu = pdata.cpu();
-        let node_id = pdata.node_id();
+        let screened = screen_private(
+            pdata.as_ref(),
+            self.config.node_epoch,
+            self.chunks.first().map(|chunk| chunk.len()),
+        )?;
         let replaced = self.conns.iter().find_map(|(key, conn)| {
-            if conn.node_id == node_id && conn.cpu == cpu && conn.purpose == purpose {
+            if conn.node_id == screened.node_id
+                && conn.cpu == screened.cpu
+                && conn.purpose == screened.purpose
+            {
                 Some(*key)
             } else {
                 None
             }
         });
-        if !admit_passive_qp(self.conns.len(), self.max_qp, replaced.is_some()) {
-            return Err(format!("rdma device QP limit {} reached", self.max_qp));
-        }
+        screen_slot(
+            self.conns.len(),
+            self.max_qp,
+            replaced.is_some(),
+            unsafe { (*client_id.as_ptr()).verbs } == unsafe { (*self.rdma.pd().as_ptr()).context },
+            &self.rdma.dev_name,
+        )?;
         if let Some(key) = replaced {
             self.drop_connection(key);
         }
-
-        let id_verbs = unsafe { (*client_id.as_ptr()).verbs };
-        let pd_ctx = unsafe { (*self.rdma.pd().as_ptr()).context };
-        if id_verbs != pd_ctx {
-            return Err(format!(
-                "connection arrived on a different RDMA device than {}",
-                self.rdma.dev_name
-            ));
-        }
+        let purpose = screened.purpose;
+        let cpu = screened.cpu;
+        let node_id = screened.node_id;
 
         let mut qp_attr = sys::ibv_qp_init_attr {
             qp_context: std::ptr::null_mut(),
@@ -470,6 +458,53 @@ impl Drop for ProviderRuntime {
     }
 }
 
+#[derive(Debug)]
+struct Screened {
+    purpose: QpPurpose,
+    cpu: u16,
+    node_id: u16,
+}
+
+fn screen_private(
+    pdata: Option<&ConnPrivateData>,
+    epoch: u32,
+    chunk_bytes: Option<usize>,
+) -> Result<Screened, String> {
+    let pdata = pdata.ok_or("missing rs_conn_pdata")?;
+    let purpose = pdata.validate(Some(epoch)).map_err(|err| err.to_string())?;
+    let chunk_bytes = chunk_bytes.ok_or("no chunk exported")?;
+    if let Some(reason) = chunk_size_error(pdata.chunk_size_mb(), chunk_bytes) {
+        return Err(format!(
+            "{reason}: client {} MiB, provider {} MiB",
+            pdata.chunk_size_mb(),
+            chunk_bytes >> 20
+        ));
+    }
+    Ok(Screened {
+        purpose,
+        cpu: pdata.cpu(),
+        node_id: pdata.node_id(),
+    })
+}
+
+fn screen_slot(
+    active: usize,
+    max_qp: i32,
+    replacing: bool,
+    same_device: bool,
+    dev_name: &str,
+) -> Result<(), String> {
+    if !admit_passive_qp(active, max_qp, replacing) {
+        return Err(format!("rdma device QP limit {max_qp} reached"));
+    }
+    if !same_device {
+        return Err(format!(
+            "connection arrived on a different RDMA device than {dev_name}"
+        ));
+    }
+    Ok(())
+}
+
 fn listen_addr_on_device(listen_addr: SocketAddrV4, dev_name: &str) -> io::Result<SocketAddrV4> {
     if !listen_addr.ip().is_unspecified() {
         return Ok(listen_addr);
@@ -484,6 +519,18 @@ fn listen_addr_on_device(listen_addr: SocketAddrV4, dev_name: &str) -> io::Resul
 }
 
 fn read_boot_id_lo() -> u64 {
+    if let Ok(s) = std::env::var("ROSWAP_TEST_BOOT_ID") {
+        let hex: String = s
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(16)
+            .collect();
+        if let Ok(v) = u64::from_str_radix(&hex, 16) {
+            if v != 0 {
+                return v;
+            }
+        }
+    }
     if let Ok(s) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
         let hex: String = s
             .chars()
@@ -589,6 +636,60 @@ mod tests {
         let rc = unsafe { sys::mincore(addr as *mut _, len, vec.as_mut_ptr()) };
         assert_eq!(rc, 0, "{}", io::Error::last_os_error());
         vec.iter().filter(|b| *b & 1 == 1).count()
+    }
+
+    #[test]
+    fn connection_screen_rejects_bad_private_data_and_a_full_device() {
+        assert_eq!(
+            screen_private(None, 1, Some(64 << 20)).unwrap_err(),
+            "missing rs_conn_pdata"
+        );
+        let mut bad = ConnPrivateData::new(QpPurpose::Fault, 0, 1, 1);
+        bad.magic_be = 0;
+        assert!(screen_private(Some(&bad), 1, Some(64 << 20))
+            .unwrap_err()
+            .contains("magic"));
+        let mut epoch = ConnPrivateData::new(QpPurpose::Fault, 0, 1, 9);
+        epoch.set_chunk_size_mb(64);
+        assert!(screen_private(Some(&epoch), 1, Some(64 << 20))
+            .unwrap_err()
+            .contains("epoch"));
+        let mut size = ConnPrivateData::new(QpPurpose::Bulk, 2, 4, 1);
+        size.set_chunk_size_mb(32);
+        assert!(screen_private(Some(&size), 1, Some(64 << 20))
+            .unwrap_err()
+            .contains("mismatch"));
+        assert!(screen_private(Some(&size), 1, None)
+            .unwrap_err()
+            .contains("no chunk"));
+        let mut ok = ConnPrivateData::new(QpPurpose::Heartbeat, 3, 7, 1);
+        ok.set_chunk_size_mb(64);
+        let screened = screen_private(Some(&ok), 1, Some(64 << 20)).unwrap();
+        assert_eq!(screened.purpose, QpPurpose::Heartbeat);
+        assert_eq!(screened.cpu, 3);
+        assert_eq!(screened.node_id, 7);
+        assert!(screen_slot(4, 4, false, true, "rxe0")
+            .unwrap_err()
+            .contains("QP limit"));
+        assert!(screen_slot(4, 4, true, true, "rxe0").is_ok());
+        assert!(screen_slot(1, 4, false, false, "rxe0")
+            .unwrap_err()
+            .contains("different RDMA device"));
+    }
+
+    #[test]
+    fn test_boot_id_override_rejects_zero_and_garbage() {
+        let saved = std::env::var("ROSWAP_TEST_BOOT_ID").ok();
+        std::env::set_var("ROSWAP_TEST_BOOT_ID", "00000000000000ab");
+        assert_eq!(read_boot_id_lo(), 0xab);
+        std::env::set_var("ROSWAP_TEST_BOOT_ID", "0");
+        let real = read_boot_id_lo();
+        std::env::set_var("ROSWAP_TEST_BOOT_ID", "zz");
+        assert_eq!(read_boot_id_lo(), real);
+        match saved {
+            Some(v) => std::env::set_var("ROSWAP_TEST_BOOT_ID", v),
+            None => std::env::remove_var("ROSWAP_TEST_BOOT_ID"),
+        }
     }
 
     #[test]

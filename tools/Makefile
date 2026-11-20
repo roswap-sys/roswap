@@ -4,6 +4,9 @@ PROGS := blkcheck memhold latread
 
 all: $(PROGS)
 
+blkcheck: blkcheck.c
+	$(CC) $(CFLAGS) -pthread -o $@ blkcheck.c
+
 clean:
 	rm -f $(PROGS)
 

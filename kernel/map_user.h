@@ -41,8 +41,8 @@ typedef struct {
 #define pr_info(fmt, ...) ((void)0)
 #define pr_warn(fmt, ...) ((void)0)
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
-#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
-#define WRITE_ONCE(x, v) ((*(volatile __typeof__(x) *)&(x)) = (v))
+#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
 #define cmpxchg(ptr, old, new) __sync_val_compare_and_swap((ptr), (old), (new))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define ULONG_MAX (~0UL)
@@ -106,8 +106,8 @@ typedef struct {
 	int v;
 } atomic_t;
 
-#define atomic_set(a, val) ((a)->v = (val))
-#define atomic_read(a) ((a)->v)
+#define atomic_set(a, val) __atomic_store_n(&(a)->v, (val), __ATOMIC_RELAXED)
+#define atomic_read(a) __atomic_load_n(&(a)->v, __ATOMIC_RELAXED)
 #define atomic_inc(a) ((void)__sync_add_and_fetch(&(a)->v, 1))
 #define atomic_dec(a) ((void)__sync_sub_and_fetch(&(a)->v, 1))
 #define atomic_add(i, a) ((void)__sync_add_and_fetch(&(a)->v, (i)))

@@ -37,6 +37,9 @@ pub const RS_A_BOOT_ID: u16 = 17;
 pub const RS_A_DEGRADED: u16 = 18;
 pub const RS_A_LOST: u16 = 19;
 pub const RS_A_NODE_LIST: u16 = 20;
+pub const RS_A_HEDGE_SENT: u16 = 22;
+pub const RS_A_HEDGE_WON: u16 = 23;
+pub const RS_A_KEY_WAIT: u16 = 24;
 
 const AF_NETLINK: i32 = 16;
 const SOCK_RAW: i32 = 3;
@@ -89,6 +92,9 @@ pub struct KernelStats {
     pub links_up: u32,
     pub degraded_slots: u32,
     pub lost_slots: u32,
+    pub hedge_sent: u32,
+    pub hedge_won: u32,
+    pub key_wait_hits: u32,
     pub nodes: Vec<NodeInfo>,
 }
 
@@ -420,6 +426,9 @@ fn stats_from_payload(payload: &[u8]) -> io::Result<KernelStats> {
         links_up: attr_u32(&attrs, RS_A_LINKS_UP)?,
         degraded_slots: attr_u32(&attrs, RS_A_DEGRADED)?,
         lost_slots: attr_u32(&attrs, RS_A_LOST)?,
+        hedge_sent: attr_u32(&attrs, RS_A_HEDGE_SENT).unwrap_or(0),
+        hedge_won: attr_u32(&attrs, RS_A_HEDGE_WON).unwrap_or(0),
+        key_wait_hits: attr_u32(&attrs, RS_A_KEY_WAIT).unwrap_or(0),
         nodes: node_list(&attrs)?,
     })
 }
@@ -603,6 +612,9 @@ mod tests {
         assert_eq!(RS_A_DEGRADED, 18);
         assert_eq!(RS_A_LOST, 19);
         assert_eq!(RS_A_NODE_LIST, 20);
+        assert_eq!(RS_A_HEDGE_SENT, 22);
+        assert_eq!(RS_A_HEDGE_WON, 23);
+        assert_eq!(RS_A_KEY_WAIT, 24);
         assert_eq!([RS_NODE_UP, RS_NODE_SUSPECT, RS_NODE_DEAD], [0, 1, 2]);
         assert_eq!(GENL_ID_CTRL, 0x10);
         assert_eq!(CTRL_CMD_GETFAMILY, 3);
@@ -742,9 +754,20 @@ mod tests {
                 links_up: 4,
                 degraded_slots: 5,
                 lost_slots: 6,
+                hedge_sent: 0,
+                hedge_won: 0,
+                key_wait_hits: 0,
                 nodes: Vec::new(),
             }
         );
+        msg.put_u32(RS_A_HEDGE_SENT, 7);
+        msg.put_u32(RS_A_HEDGE_WON, 8);
+        msg.put_u32(RS_A_KEY_WAIT, 9);
+        msg.finish();
+        let counted = stats_from_payload(payload(&msg)).unwrap();
+        assert_eq!(counted.hedge_sent, 7);
+        assert_eq!(counted.hedge_won, 8);
+        assert_eq!(counted.key_wait_hits, 9);
         let mut bad = msg.clone();
         bad.put_bytes(RS_A_NODE_LIST, &[2, 0, 1, 0, 9]);
         bad.finish();
@@ -819,35 +842,6 @@ mod tests {
         groups.finish();
         assert_eq!(event_group_id(payload(&groups)), Some(12));
         assert_eq!(event_group_id(&[]), None);
-    }
-
-    #[test]
-    #[ignore]
-    fn kernel_rejects_illegal_netlink() {
-        let mut client = GenlClient::open().expect("netlink");
-        client
-            .node_add(9, "127.0.0.1:18619", None)
-            .expect("first add");
-        client
-            .node_add(9, "127.0.0.1:18619", None)
-            .expect("same address is idempotent");
-        let changed = client
-            .node_add(9, "127.0.0.1:18620", None)
-            .expect_err("address change");
-        assert!(is_already_exists(&changed));
-        let missing = client
-            .node_set_state(65000, RS_NODE_SUSPECT)
-            .expect_err("unknown node");
-        assert_eq!(missing.raw_os_error(), Some(2));
-        let retired = client.chunk_retire(65000, 1).expect_err("unknown chunk");
-        assert_eq!(retired.raw_os_error(), Some(2));
-        let short = client
-            .command(RS_CMD_NODE_SET_STATE, |msg| {
-                msg.put_bytes(RS_A_NODE_ID, &[1]);
-                msg.put_u32(RS_A_NODE_STATE, RS_NODE_DEAD);
-            })
-            .expect_err("short attribute");
-        assert_eq!(short.raw_os_error(), Some(22));
     }
 
     #[test]

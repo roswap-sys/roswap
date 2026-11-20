@@ -9,7 +9,7 @@ on:
       - 'build.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'tests/e2e/setup-rxe.sh'
+      - 'tests/e2e/run.py'
       - '.github/workflows/rust.yml'
       - '.github/scripts/apt-install.sh'
       - '.github/scripts/setup-soft-roce.sh'

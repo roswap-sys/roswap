@@ -40,7 +40,7 @@ jobs:
     - name: Install build dependencies
       run: |
         bash .github/scripts/apt-install.sh \
-          build-essential linux-headers-$(uname -r) \
+          build-essential linux-headers-$(uname -r) python3 \
           libibverbs-dev librdmacm-dev protobuf-compiler
 
     - uses: Swatinem/rust-cache@v2
@@ -55,31 +55,37 @@ jobs:
       run: bash .github/scripts/setup-soft-roce.sh
 
     - name: Block device
-      run: sudo tests/e2e/run.sh blk
+      run: sudo python3 tests/e2e/run.py blk
 
     - name: Swap
-      run: sudo tests/e2e/run.sh swap
+      run: sudo python3 tests/e2e/run.py swap
 
     - name: Fault injection
-      run: sudo tests/e2e/run.sh fault
+      run: sudo python3 tests/e2e/run.py fault
 
     - name: Module parameters
-      run: sudo tests/e2e/run.sh params
+      run: sudo python3 tests/e2e/run.py params
 
     - name: Reconnect under IO
-      run: sudo tests/e2e/run.sh stress
+      run: sudo python3 tests/e2e/run.py stress
 
     - name: Illegal netlink
-      run: sudo tests/e2e/run.sh genl
+      run: sudo python3 tests/e2e/run.py genl
+
+    - name: Two replicas
+      run: sudo python3 tests/e2e/run.py replica2
+
+    - name: Read hedge
+      run: sudo python3 tests/e2e/run.py hedge
 
     - name: Suspect node
-      run: sudo tests/e2e/run.sh suspect
+      run: sudo python3 tests/e2e/run.py suspect
 
     - name: Dead node
-      run: sudo tests/e2e/run.sh dead
+      run: sudo python3 tests/e2e/run.py dead
 
     - name: Fault-detection robustness
-      run: sudo tests/e2e/run.sh robust
+      run: sudo python3 tests/e2e/run.py robust
 
     - name: Collect logs
       if: failure()
@@ -100,7 +106,6 @@ jobs:
         if-no-files-found: ignore
 
   userspace:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -116,7 +121,7 @@ jobs:
       run: |
         cargo build --locked --release --bins
         make -C tools
-        tar -cf userspace.tar target/release/roswapd target/release/roswapctl tools/blkcheck tools/memhold
+        tar -cf userspace.tar target/release/roswapd target/release/roswapctl tools/blkcheck tools/memhold tools/latread
 
     - uses: actions/upload-artifact@v4
       with:
@@ -133,7 +138,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [ "5.10", "6.1", "6.18", "stable" ]
+        kernel: ${{ fromJSON(github.event_name == 'pull_request' && '["6.1"]' || '["5.10", "6.1", "6.18", "stable"]') }}
         include:
           - kernel: "5.10"
             cc: "gcc-11"
@@ -210,14 +215,14 @@ jobs:
         mkdir -p "$out"
         cd "$KDIR"
         set +e
-        vng --verbose --disable-microvm $VNG_ARGS --user root --cpus 2 --memory 3G \
+        vng --verbose --disable-microvm $VNG_ARGS --user root --cpus 4 --memory 3G \
           --rwdir "$GITHUB_WORKSPACE" \
-          --exec "$GITHUB_WORKSPACE/tests/e2e/vm-run.sh $out" 2>&1 | tee "$out/console.txt"
+          --exec "python3 $GITHUB_WORKSPACE/tests/e2e/run.py --vm-out $out" 2>&1 | tee "$out/console.txt"
         vng_rc=${PIPESTATUS[0]}
         set -e
         cat "$out/summary.txt" 2>/dev/null || true
         if [ ! -f "$out/result" ]; then
-          echo "::error::vm did not reach vm-run.sh (vng exit $vng_rc); see the kernel console above or console.txt"
+          echo "::error::vm did not reach run.py (vng exit $vng_rc); see the kernel console above or console.txt"
           exit 1
         fi
         test "$(cat "$out/result")" = 0

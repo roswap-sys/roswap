@@ -97,8 +97,13 @@ int main(void)
 	int i;
 
 	signal(SIGALRM, on_alarm);
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+	alarm(60);
+	for (i = 0; i < 400; i++) {
+#else
 	alarm(5);
 	for (i = 0; i < 2000; i++) {
+#endif
 		run_once(1, 0);
 		run_once(0, 1);
 		run_once(1, 1);

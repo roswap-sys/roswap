@@ -149,6 +149,14 @@ async fn wait_stop(stop: &AtomicBool, dur: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::cluster_service_server::{ClusterService, ClusterServiceServer};
+    use crate::proto::{
+        GetClusterRequest, GetClusterResponse, HeartbeatResponse, JoinResponse,
+        ReportChunksRequest, ReportChunksResponse,
+    };
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tonic::{Response, Status};
 
     #[test]
     fn heartbeat_carries_the_remote_page() {
@@ -172,5 +180,134 @@ mod tests {
         let join = join_request(7, 2, "10.0.0.7:18515", hb);
         assert_eq!(join.hb_raddr, 0xabc);
         assert_eq!(join.boot_id_lo, 42);
+    }
+
+    struct Gate {
+        open: Arc<AtomicBool>,
+        joins: Arc<AtomicUsize>,
+        beats: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl ClusterService for Gate {
+        async fn join(
+            &self,
+            _request: tonic::Request<crate::proto::JoinRequest>,
+        ) -> Result<Response<JoinResponse>, Status> {
+            if !self.open.load(Ordering::Relaxed) {
+                return Err(Status::unavailable("closed"));
+            }
+            self.joins.fetch_add(1, Ordering::Relaxed);
+            Ok(Response::new(JoinResponse {}))
+        }
+
+        async fn report_chunks(
+            &self,
+            _request: tonic::Request<ReportChunksRequest>,
+        ) -> Result<Response<ReportChunksResponse>, Status> {
+            Ok(Response::new(ReportChunksResponse {}))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: tonic::Request<crate::proto::HeartbeatRequest>,
+        ) -> Result<Response<HeartbeatResponse>, Status> {
+            if !self.open.load(Ordering::Relaxed) {
+                return Err(Status::unavailable("closed"));
+            }
+            self.beats.fetch_add(1, Ordering::Relaxed);
+            Ok(Response::new(HeartbeatResponse {}))
+        }
+
+        async fn get_cluster(
+            &self,
+            _request: tonic::Request<GetClusterRequest>,
+        ) -> Result<Response<GetClusterResponse>, Status> {
+            Ok(Response::new(GetClusterResponse { nodes: Vec::new() }))
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_retries_across_a_closed_controller() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let open = Arc::new(AtomicBool::new(false));
+        let joins = Arc::new(AtomicUsize::new(0));
+        let beats = Arc::new(AtomicUsize::new(0));
+        let gate = Gate {
+            open: Arc::clone(&open),
+            joins: Arc::clone(&joins),
+            beats: Arc::clone(&beats),
+        };
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_wait = Arc::clone(&stop_srv);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ClusterServiceServer::new(gate))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        while !stop_wait.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    },
+                )
+                .await
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reg = Arc::clone(&stop);
+        let hb = crate::genl::NodeHb {
+            raddr: 0x1000,
+            rkey: 1,
+            boot_id: 7,
+        };
+        let worker = tokio::spawn(async move {
+            register_loop(
+                addr,
+                3,
+                1,
+                "10.0.0.3:18515".to_string(),
+                Vec::new(),
+                hb,
+                stop_reg,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(joins.load(Ordering::Relaxed), 0);
+        open.store(true, Ordering::Relaxed);
+        let mut ready = false;
+        for _ in 0..40 {
+            if joins.load(Ordering::Relaxed) >= 1 && beats.load(Ordering::Relaxed) >= 1 {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "registration did not recover");
+        let seen = beats.load(Ordering::Relaxed);
+        open.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        open.store(true, Ordering::Relaxed);
+        let mut grew = false;
+        for _ in 0..40 {
+            if beats.load(Ordering::Relaxed) > seen {
+                grew = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(grew, "heartbeat did not resume");
+        stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("register loop")
+            .unwrap();
+        stop_srv.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server")
+            .unwrap()
+            .unwrap();
     }
 }

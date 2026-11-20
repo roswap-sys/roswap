@@ -623,7 +623,7 @@ static void test_concurrent_map(void)
 	reset_map(32);
 	expect(rs_map_node_add(1) == 0, "node");
 	expect(rs_map_chunk_add(1, 0, 1, 0x600000000ULL, 3, 32) == 0, "chunk");
-	alarm(5);
+	alarm(30);
 	for (i = 0; i < 4; i++) {
 		jobs[i].cpu = i;
 		jobs[i].base = (u32)i * 8;
@@ -683,6 +683,125 @@ static u16 placed_nodes(u32 n, u32 mode)
 		rs_map_finish_write((u64)i << 12, remote.mask);
 	}
 	return saw;
+}
+
+static void *rs_busy_worker(void *arg)
+{
+	struct rs_race_job *job = arg;
+	u32 i;
+
+	rs_map_test_set_cpu(job->cpu);
+	for (i = 0; i < job->n; i++) {
+		struct rs_copies remote;
+		u64 off = (u64)(i % 4) << 12;
+		int ret = rs_map_prepare_write(off, 4096, &remote);
+
+		if (ret == 0)
+			rs_map_finish_write(off, remote.mask);
+		else if (ret != -EBUSY)
+			job->fail = 1;
+		ret = rs_map_lookup_read(off, 4096, &remote);
+		if (ret == 0)
+			rs_map_finish(off);
+		else if (ret != -EBUSY && ret != RS_MAP_ZERO && ret != -EIO)
+			job->fail = 1;
+	}
+	return NULL;
+}
+
+static void test_same_slot_and_discard_race(void)
+{
+	struct rs_race_job jobs[4];
+	pthread_t threads[4];
+	struct rs_map_stats st;
+	struct rs_copies remote;
+	int i;
+
+	if (signal(SIGALRM, on_alarm) == SIG_ERR)
+		expect(0, "alarm");
+	reset_map(1);
+	expect(rs_map_node_add(1) == 0, "node");
+	expect(rs_map_chunk_add(1, 0, 1, 0x700000000ULL, 3, 1) == 0, "chunk");
+	alarm(30);
+	for (i = 0; i < 4; i++) {
+		jobs[i].cpu = i;
+		jobs[i].base = 0;
+		jobs[i].n = 200;
+		jobs[i].fail = 0;
+		expect(pthread_create(&threads[i], NULL, rs_busy_worker, &jobs[i]) == 0,
+		       "start same-slot racer");
+	}
+	for (i = 0; i < 4; i++) {
+		expect(pthread_join(threads[i], NULL) == 0, "join same-slot racer");
+		expect(!jobs[i].fail, "same-slot racer io");
+	}
+	alarm(0);
+	for (i = 0; i < 4; i++) {
+		int ret = rs_map_lookup_read((u64)i << 12, 4096, &remote);
+
+		expect(ret == 0 || ret == RS_MAP_ZERO, "page is readable after the race");
+		if (ret == 0)
+			rs_map_finish((u64)i << 12);
+	}
+	rs_map_stats(&st);
+	expect(st.free_extents + (st.used_slots ? 1 : 0) <= 4, "extents stayed in range");
+	rs_map_test_set_cpu(0);
+}
+
+static void *rs_discard_worker(void *arg)
+{
+	struct rs_race_job *job = arg;
+	u32 i;
+
+	rs_map_test_set_cpu(job->cpu);
+	for (i = 0; i < job->n; i++) {
+		struct rs_copies remote;
+		u64 off = (u64)(i % 8) << 12;
+		int ret = rs_map_prepare_write(off, 4096, &remote);
+
+		if (ret == 0)
+			rs_map_finish_write(off, remote.mask);
+		else if (ret != -EBUSY)
+			job->fail = 1;
+		ret = rs_map_discard(off, 4096);
+		if (ret && ret != -EBUSY)
+			job->fail = 1;
+	}
+	return NULL;
+}
+
+static void test_discard_write_race(void)
+{
+	struct rs_race_job jobs[4];
+	pthread_t threads[4];
+	struct rs_copies remote;
+	int i;
+
+	reset_map(1);
+	expect(rs_map_node_add(1) == 0, "node");
+	expect(rs_map_chunk_add(1, 0, 1, 0x710000000ULL, 4, 1) == 0, "chunk");
+	alarm(30);
+	for (i = 0; i < 4; i++) {
+		jobs[i].cpu = i;
+		jobs[i].n = 80;
+		jobs[i].fail = 0;
+		expect(pthread_create(&threads[i], NULL, rs_discard_worker, &jobs[i]) == 0,
+		       "start discard racer");
+	}
+	for (i = 0; i < 4; i++) {
+		expect(pthread_join(threads[i], NULL) == 0, "join discard racer");
+		expect(!jobs[i].fail, "discard racer io");
+	}
+	alarm(0);
+	for (i = 0; i < 8; i++) {
+		int ret = rs_map_lookup_read((u64)i << 12, 4096, &remote);
+
+		expect(ret == 0 || ret == RS_MAP_ZERO || ret == -EIO,
+		       "discard race left a stable page");
+		if (ret == 0)
+			rs_map_finish((u64)i << 12);
+	}
+	rs_map_test_set_cpu(0);
 }
 
 static void test_node_health(void)
@@ -810,6 +929,8 @@ int main(void)
 	test_same_local_gid();
 	test_steal_reserve();
 	test_concurrent_map();
+	test_same_slot_and_discard_race();
+	test_discard_write_race();
 	test_hb_step();
 	test_node_health();
 	rs_map_exit();

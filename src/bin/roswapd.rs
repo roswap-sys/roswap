@@ -170,6 +170,8 @@ fn spawn_provider_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn sighandler_sets_the_published_flag() {
@@ -177,5 +179,24 @@ mod tests {
         publish_stop_flag(&stop);
         on_stop_signal(sys::SIGTERM);
         assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn grpc_bind_failure_stops_the_provider() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let handle = spawn_provider_rpc(addr, Arc::clone(&stop), Arc::clone(&failed));
+        for _ in 0..50 {
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(failed.load(Ordering::Relaxed));
+        assert!(stop.load(Ordering::Relaxed));
+        handle.join().unwrap();
+        drop(held);
     }
 }
